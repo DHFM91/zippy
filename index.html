@@ -308,8 +308,25 @@
   const PELLET_WAVE_COUNT = 5; // separate wave passes layered per life
   const PELLET_PLACEMENT_ATTEMPTS = 8; // random-relocation retries before giving up on a pellet
 
+  // standard ray-casting point-in-polygon test - needed because obstacles
+  // can be large enough that their center is farther than `margin` from
+  // every edge, so an edge-distance check alone misses pellets that land
+  // deep inside a shape rather than near its border
+  function pointInPolygon(x, y, points) {
+    let inside = false;
+    for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+      const xi = points[i][0], yi = points[i][1];
+      const xj = points[j][0], yj = points[j][1];
+      const intersect = ((yi > y) !== (yj > y)) &&
+        (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
   function tooCloseToObstacle(x, y, margin) {
     for (const obs of obstacles) {
+      if (pointInPolygon(x, y, obs.points)) return true;
       for (const [a, b] of obs.edges) {
         const [cx, cy] = closestPointOnSegment(x, y, a[0], a[1], b[0], b[1]);
         if (Math.hypot(x - cx, y - cy) < margin) return true;
@@ -347,20 +364,34 @@
     const amplitude = randRange(40, 90);
     const freq = randRange(1.5, 3.5);
     const phase = randRange(0, Math.PI * 2);
-    const baseY = randRange(150, 430);
-    const marginX = 60;
-    const usableW = W - marginX * 2;
+    // each wave's baseline is drawn at a random angle (0-180deg - a line at
+    // theta looks the same as theta+180, so that range covers every distinct
+    // orientation) through a random center point, instead of always running
+    // straight left-to-right, so the 5 layered waves crosshatch into a more
+    // uniform-looking field instead of stacked horizontal bands
+    const angle = randRange(0, Math.PI);
+    const length = randRange(360, 560);
+    const cx = randRange(150, W - 150);
+    const cy = randRange(180, H - 130);
+    const cosA = Math.cos(angle), sinA = Math.sin(angle);
+
     for (let i = 0; i < PELLET_COUNT; i++) {
-      const t = i / (PELLET_COUNT - 1);
-      const x = marginX + t * usableW;
-      const theta = t * freq * Math.PI * 2 + phase;
+      const t = i / (PELLET_COUNT - 1) - 0.5; // -0.5..0.5 along the baseline
+      const along = t * length;
+      const theta = (t + 0.5) * freq * Math.PI * 2 + phase;
       let raw;
       if (waveType === "sin") raw = Math.sin(theta);
       else if (waveType === "cos") raw = Math.cos(theta);
       else raw = Math.max(-1, Math.min(1, Math.tan(theta) * 0.3)); // tan blows up near its asymptotes, so scale + clamp it
-      let y = baseY + raw * amplitude;
-      y = Math.max(85, Math.min(H - 20, y));
-      placePellet(x, y, out);
+      const across = raw * amplitude;
+
+      // rotate the (along, across) point by `angle` around the origin,
+      // then place it relative to this wave's center point
+      const x = cx + along * cosA - across * sinA;
+      const y = cy + along * sinA + across * cosA;
+      const clampedX = Math.max(30, Math.min(W - 30, x));
+      const clampedY = Math.max(85, Math.min(H - 20, y));
+      placePellet(clampedX, clampedY, out);
     }
   }
 
@@ -894,4 +925,3 @@
 </script>
 </body>
 </html>
-
