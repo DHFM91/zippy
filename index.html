@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zippy</title>
+<style>
+  :root {
+    --bg: #0b1220;
+    --card: #141b2d;
+    --text: #f1f5f9;
+    --muted: #8ea0bd;
+    --accent: #38bdf8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: var(--text);
+    padding: 24px;
+    gap: 16px;
+  }
+  header { text-align: center; }
+  h1 {
+    margin: 0;
+    font-size: 32px;
+    letter-spacing: 1px;
+    background: linear-gradient(90deg, #38bdf8, #a78bfa);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  p.tagline {
+    margin: 4px 0 0;
+    color: var(--muted);
+    font-size: 14px;
+  }
+  p.hint {
+    margin: 4px 0 0;
+    color: #4ade80;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .stage-wrap {
+    background: var(--card);
+    border-radius: 16px;
+    padding: 16px;
+    box-shadow: 0 20px 40px rgba(0,0,0,0.4);
+    width: 100%;
+    max-width: 900px;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    aspect-ratio: 3 / 2;
+    border-radius: 10px;
+    background: #0f172a;
+  }
+  footer {
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  /* ---------- touch controls ---------- */
+  /* A drag joystick instead of hold-buttons: continuous drag gestures
+     don't trigger iOS's long-press "select/copy" callout the way a
+     sustained hold on a static button can. */
+  .joystick-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin: 16px auto 0;
+  }
+  .joystick-zone {
+    width: 140px;
+    height: 140px;
+    border-radius: 50%;
+    background: rgba(148,163,184,0.08);
+    border: 1px solid rgba(148,163,184,0.35);
+    position: relative;
+    touch-action: none;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .joystick-handle {
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    background: rgba(74,222,128,0.28);
+    border: 1px solid #4ade80;
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+  }
+  .joy-label {
+    margin: 8px 0 0;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  /* ---------- mobile: shrink chrome so more of the screen is game ---------- */
+  @media (max-width: 640px) {
+    body { padding: 8px; gap: 8px; }
+    h1 { font-size: 20px; letter-spacing: 0.5px; }
+    p.tagline { font-size: 10px; margin-top: 2px; }
+    p.hint { font-size: 10px; margin-top: 2px; }
+    .stage-wrap { padding: 8px; border-radius: 12px; }
+    .joystick-wrap { margin-top: 8px; }
+    .joystick-zone { width: 112px; height: 112px; }
+    .joystick-handle { width: 46px; height: 46px; }
+    .joy-label { font-size: 10px; margin-top: 4px; }
+  }
+  @media (max-width: 640px) and (max-height: 700px) {
+    p.tagline { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>ZIPPY</h1>
+  <p class="tagline">Build 8 &middot; wave pellets, randomized obstacles, mobile-friendly layout</p>
+  <p class="hint">WASD (or drag the joystick below on touch) to fly Zippy around the arena</p>
+</header>
+<div class="stage-wrap">
+  <canvas id="stage" width="900" height="600"></canvas>
+  <div class="joystick-wrap">
+    <div class="joystick-zone" id="joystick" aria-label="Drag to steer Zippy">
+      <div class="joystick-handle"></div>
+    </div>
+    <p class="joy-label">Drag to steer</p>
+  </div>
+</div>
+<footer>Zippy &middot; recreated from a 1999 BASIC original</footer>
+
+<script>
+(function () {
+  const canvas = document.getElementById("stage");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  const SPEED = 260; // px/sec, the enemy balls' starting speed at the top of each life
+  const ENEMY_SPEED_RAMP = 6; // px/sec added per second survived, so it gets harder the longer you last
+  const ENEMY_MAX_SPEED = 520; // cap so the ramp doesn't run away forever
+  const SPECIAL_COLOR = "#4ade80";
+  const GAME_OVER_MS = 3000;
+  const SPAWN_GRACE_MS = 1500; // brief invulnerability right after a respawn
+
+  // Zippy (the player ball) has no built-in velocity of its own.
+  // It only moves under WASD thrust, can go noticeably faster than the
+  // other balls, and therefore bounces harder off walls/obstacles.
+  const SPECIAL_MAX_SPEED = 340; // ~1.3x the other balls' constant speed
+  const SPECIAL_ACCEL = 1200;    // px/sec^2 while a direction key is held
+  const SPECIAL_FRICTION = 3.5;  // higher = stops faster when keys are released
+
+  const PELLET_RADIUS = 5;
+  const PELLET_COUNT = 10;   // pellets sown along the wave each life (some may be skipped if they'd land on an obstacle/HUD box)
+  const PELLET_BONUS = 500;  // flat points added to score per pellet collected
+  const POPUP_LIFE = 700;    // ms a "+500" pickup popup stays on screen
+
+  // ---------- input (keyboard) ----------
+  const keys = { w: false, a: false, s: false, d: false };
+  window.addEventListener("keydown", (e) => {
+    const k = e.key.toLowerCase();
+    if (k in keys) { keys[k] = true; e.preventDefault(); }
+  });
+  window.addEventListener("keyup", (e) => {
+    const k = e.key.toLowerCase();
+    if (k in keys) { keys[k] = false; e.preventDefault(); }
+  });
+
+  // ---------- input (touch joystick) ----------
+  // Drag anywhere in the joystick zone; the handle follows the finger
+  // (clamped to a max radius) and the drag vector becomes an analog
+  // thrust direction/strength, fed into the same physics as WASD below.
+  // This is a continuous drag gesture rather than a held button, which
+  // is what actually avoids iOS's long-press "select/copy" callout.
+  const touch = { x: 0, y: 0 }; // -1..1 per axis, magnitude <= 1
+  const joyZone = document.getElementById("joystick");
+  const joyHandle = joyZone ? joyZone.querySelector(".joystick-handle") : null;
+  let joyPointerId = null;
+
+  function setHandle(dx, dy) {
+    if (joyHandle) joyHandle.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+  }
+
+  function joyMove(e) {
+    if (joyPointerId === null || e.pointerId !== joyPointerId) return;
+    e.preventDefault();
+    const rect = joyZone.getBoundingClientRect();
+    // max travel is read live from the zone's rendered size (rather than a
+    // fixed px constant) so the mobile CSS media query, which shrinks the
+    // joystick, "just works" without any JS changes to match it
+    const maxR = rect.width / 2 - 6;
+    let dx = e.clientX - (rect.left + rect.width / 2);
+    let dy = e.clientY - (rect.top + rect.height / 2);
+    const dist = Math.hypot(dx, dy);
+    if (dist > maxR) {
+      dx = (dx / dist) * maxR;
+      dy = (dy / dist) * maxR;
+    }
+    touch.x = dx / maxR;
+    touch.y = dy / maxR;
+    setHandle(dx, dy);
+  }
+  function joyEnd(e) {
+    if (joyPointerId === null || e.pointerId !== joyPointerId) return;
+    joyPointerId = null;
+    touch.x = 0;
+    touch.y = 0;
+    setHandle(0, 0);
+  }
+  if (joyZone) {
+    joyZone.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      joyPointerId = e.pointerId;
+      joyZone.setPointerCapture(e.pointerId);
+      joyMove(e);
+    });
+    joyZone.addEventListener("pointermove", joyMove);
+    joyZone.addEventListener("pointerup", joyEnd);
+    joyZone.addEventListener("pointercancel", joyEnd);
+    joyZone.addEventListener("contextmenu", (e) => e.preventDefault());
+  }
+
+  // ---------- geometry helpers ----------
+  function regularPolygon(cx, cy, r, sides, rotationDeg) {
+    const pts = [];
+    const rot = (rotationDeg || 0) * Math.PI / 180;
+    for (let i = 0; i < sides; i++) {
+      const a = rot + (i / sides) * Math.PI * 2;
+      pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
+    }
+    return pts;
+  }
+
+  function rotatedRect(cx, cy, w, h, angleDeg) {
+    const a = angleDeg * Math.PI / 180;
+    const hw = w / 2, hh = h / 2;
+    const corners = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+    return corners.map(([x, y]) => [
+      cx + x * Math.cos(a) - y * Math.sin(a),
+      cy + x * Math.sin(a) + y * Math.cos(a)
+    ]);
+  }
+
+  function edgesOf(points) {
+    const edges = [];
+    for (let i = 0; i < points.length; i++) {
+      edges.push([points[i], points[(i + 1) % points.length]]);
+    }
+    return edges;
+  }
+
+  function randRange(min, max) { return min + Math.random() * (max - min); }
+  function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+  // ---------- obstacles ----------
+  // Five fixed "slots" (positions + accent colors) that stay clear of the
+  // spawn points and HUD boxes; the actual shape in each slot is re-rolled
+  // every life so the arena layout is never quite the same twice.
+  const OBSTACLE_SLOTS = [
+    { cx: 210, cy: 150, fill: "rgba(56,189,248,0.16)", stroke: "#38bdf8" },
+    { cx: 690, cy: 140, fill: "rgba(250,204,21,0.16)", stroke: "#facc15" },
+    { cx: 460, cy: 470, fill: "rgba(167,139,250,0.16)", stroke: "#a78bfa" },
+    { cx: 170, cy: 460, fill: "rgba(74,222,128,0.16)", stroke: "#4ade80" },
+    { cx: 770, cy: 300, fill: "rgba(249,115,22,0.16)", stroke: "#f97316" }
+  ];
+
+  function generateObstacles() {
+    return OBSTACLE_SLOTS.map(slot => {
+      let points;
+      if (Math.random() < 0.4) {
+        // an angled bar
+        const w = randRange(140, 190);
+        const h = randRange(18, 26);
+        const angle = randRange(-50, 50);
+        points = rotatedRect(slot.cx, slot.cy, w, h, angle);
+      } else {
+        // a regular polygon, anywhere from a triangle to a heptagon
+        const sides = 3 + Math.floor(randRange(0, 5)); // 3..7
+        const r = randRange(50, 76);
+        const rotation = randRange(0, 360);
+        points = regularPolygon(slot.cx, slot.cy, r, sides, rotation);
+      }
+      return { points, fill: slot.fill, stroke: slot.stroke, edges: edgesOf(points) };
+    });
+  }
+
+  let obstacles = generateObstacles();
+
+  // ---------- pellets ----------
+  // Pacman-style bonus pellets, sown along a randomly chosen sine, cosine
+  // or tangent wave across the arena. Each one is a flat, significant
+  // point bonus the moment Zippy touches it - re-rolled every life.
+  function tooCloseToObstacle(x, y, margin) {
+    for (const obs of obstacles) {
+      for (const [a, b] of obs.edges) {
+        const [cx, cy] = closestPointOnSegment(x, y, a[0], a[1], b[0], b[1]);
+        if (Math.hypot(x - cx, y - cy) < margin) return true;
+      }
+    }
+    return false;
+  }
+
+  function inHudZone(x, y) {
+    const pad = 10;
+    if (x > 10 - pad && x < 160 + pad && y > 10 - pad && y < 54 + pad) return true;          // DISTANCE box
+    if (x > W - 160 - pad && x < W - 10 + pad && y > 10 - pad && y < 54 + pad) return true;  // TIME box
+    if (x > W / 2 - 100 - pad && x < W / 2 + 100 + pad && y > 10 - pad && y < 64 + pad) return true; // SCORE box
+    return false;
+  }
+
+  function generatePellets() {
+    const waveType = pick(["sin", "cos", "tan"]);
+    const amplitude = randRange(40, 90);
+    const freq = randRange(1.5, 3.5);
+    const phase = randRange(0, Math.PI * 2);
+    const baseY = randRange(150, 430);
+    const marginX = 60;
+    const usableW = W - marginX * 2;
+    const out = [];
+    for (let i = 0; i < PELLET_COUNT; i++) {
+      const t = i / (PELLET_COUNT - 1);
+      const x = marginX + t * usableW;
+      const theta = t * freq * Math.PI * 2 + phase;
+      let raw;
+      if (waveType === "sin") raw = Math.sin(theta);
+      else if (waveType === "cos") raw = Math.cos(theta);
+      else raw = Math.max(-1, Math.min(1, Math.tan(theta) * 0.3)); // tan blows up near its asymptotes, so scale + clamp it
+      let y = baseY + raw * amplitude;
+      y = Math.max(85, Math.min(H - 20, y));
+      if (!tooCloseToObstacle(x, y, PELLET_RADIUS + 6) && !inHudZone(x, y)) {
+        out.push({ x, y, r: PELLET_RADIUS, collected: false });
+      }
+    }
+    return out;
+  }
+
+  let pellets = generatePellets();
+  let popups = []; // transient "+500" pickup feedback text
+
+  // ---------- balls ----------
+  // Zippy (special) spawns away from the other four, in a clear corner,
+  // so a respawn doesn't land it right back in the middle of the pack.
+  // The other four each get their own angry/mean face style (faceVariant
+  // 0-3), so every rival looks distinct.
+  const colors = ["#38bdf8", "#f97316", "#facc15", "#a78bfa", "#4ade80"];
+  const spawnPoints = [[400, 300], [500, 300], [450, 250], [450, 350], [450, 130]];
+  const RADIUS = 11;
+
+  function initBalls() {
+    return spawnPoints.map((p, i) => {
+      const special = colors[i] === SPECIAL_COLOR;
+      const angle = Math.random() * Math.PI * 2;
+      return {
+        x: p[0], y: p[1],
+        vx: special ? 0 : Math.cos(angle) * SPEED,
+        vy: special ? 0 : Math.sin(angle) * SPEED,
+        r: RADIUS,
+        color: colors[i],
+        special,
+        faceVariant: i % 4
+      };
+    });
+  }
+
+  // ---------- score / high score (localStorage) ----------
+  // score is simply distance * timeSurvived, recalculated live every
+  // frame so it's always current on screen (not just at game over).
+  function loadBest() {
+    try {
+      const d = parseFloat(localStorage.getItem("zippy_bestDistance"));
+      const t = parseFloat(localStorage.getItem("zippy_bestTime"));
+      const s = parseFloat(localStorage.getItem("zippy_bestScore"));
+      return { d: isFinite(d) ? d : 0, t: isFinite(t) ? t : 0, s: isFinite(s) ? s : 0 };
+    } catch (e) {
+      return { d: 0, t: 0, s: 0 }; // storage blocked (private mode, file://, etc.)
+    }
+  }
+  function saveBest(d, t, s) {
+    try {
+      localStorage.setItem("zippy_bestDistance", String(Math.round(d)));
+      localStorage.setItem("zippy_bestTime", String(Math.round(t)));
+      localStorage.setItem("zippy_bestScore", String(Math.round(s)));
+    } catch (e) { /* ignore - best-effort persistence */ }
+  }
+  function pad(n, width) {
+    return String(Math.max(0, Math.round(n))).padStart(width || 4, "0");
+  }
+
+  const loaded = loadBest();
+  let bestDistance = loaded.d;
+  let bestTime = loaded.t;
+  let bestScore = loaded.s;
+  let newBestDistance = false;
+  let newBestTime = false;
+  let newBestScore = false;
+  let distance = 0;
+  let timeSurvived = 0;
+  let pelletScore = 0;
+  let score = 0;
+
+  let balls = initBalls();
+  let gameOver = false;
+  let gameOverUntil = 0;
+  let graceUntil = 0;
+
+  // ---------- collision helpers ----------
+  function closestPointOnSegment(px, py, ax, ay, bx, by) {
+    const abx = bx - ax, aby = by - ay;
+    const t0 = ((px - ax) * abx + (py - ay) * aby) / (abx * abx + aby * aby);
+    const t = Math.max(0, Math.min(1, t0));
+    return [ax + abx * t, ay + aby * t];
+  }
+
+  function normalize(x, y) {
+    const len = Math.hypot(x, y) || 1;
+    return [x / len, y / len];
+  }
+
+  function resolveObstacleCollisions(ball) {
+    for (const obs of obstacles) {
+      for (const [a, b] of obs.edges) {
+        const [cx, cy] = closestPointOnSegment(ball.x, ball.y, a[0], a[1], b[0], b[1]);
+        const dx = ball.x - cx, dy = ball.y - cy;
+        const dist = Math.hypot(dx, dy);
+        if (dist < ball.r && dist > 0.0001) {
+          const [nx, ny] = normalize(dx, dy);
+          const dot = ball.vx * nx + ball.vy * ny;
+          if (dot < 0) {
+            ball.vx -= 2 * dot * nx;
+            ball.vy -= 2 * dot * ny;
+          }
+          const overlap = ball.r - dist + 0.5;
+          ball.x += nx * overlap;
+          ball.y += ny * overlap;
+        }
+      }
+    }
+  }
+
+  function resolveWallCollisions(ball) {
+    if (ball.x - ball.r < 0) { ball.x = ball.r; ball.vx = Math.abs(ball.vx); }
+    if (ball.x + ball.r > W) { ball.x = W - ball.r; ball.vx = -Math.abs(ball.vx); }
+    if (ball.y - ball.r < 0) { ball.y = ball.r; ball.vy = Math.abs(ball.vy); }
+    if (ball.y + ball.r > H) { ball.y = H - ball.r; ball.vy = -Math.abs(ball.vy); }
+  }
+
+  // keep speed exactly constant for the non-player balls, even after
+  // floating point drift from repeated bounces
+  function clampSpeed(ball, speed) {
+    const [nx, ny] = normalize(ball.vx, ball.vy);
+    ball.vx = nx * speed;
+    ball.vy = ny * speed;
+  }
+
+  // enemy balls start at SPEED and ramp up the longer the current life lasts
+  function enemySpeedNow() {
+    return Math.min(ENEMY_MAX_SPEED, SPEED + ENEMY_SPEED_RAMP * timeSurvived);
+  }
+
+  // WASD / touch thrust + friction + hard speed cap for Zippy
+  function applyPlayerControl(ball, dt) {
+    // combine digital WASD with the analog joystick drag into one
+    // thrust vector; magnitude scales the accel so a light drag on the
+    // joystick gives a gentler push than shoving it to the edge
+    let ax = 0, ay = 0;
+    if (keys.w) ay -= 1;
+    if (keys.s) ay += 1;
+    if (keys.a) ax -= 1;
+    if (keys.d) ax += 1;
+    ax += touch.x;
+    ay += touch.y;
+    const inputMag = Math.hypot(ax, ay);
+    if (inputMag > 0.0001) {
+      const scale = Math.min(inputMag, 1);
+      const nx = ax / inputMag, ny = ay / inputMag;
+      ball.vx += nx * SPECIAL_ACCEL * scale * dt;
+      ball.vy += ny * SPECIAL_ACCEL * scale * dt;
+    }
+    const decay = Math.exp(-SPECIAL_FRICTION * dt);
+    ball.vx *= decay;
+    ball.vy *= decay;
+    const speed = Math.hypot(ball.vx, ball.vy);
+    if (speed > SPECIAL_MAX_SPEED) {
+      const s = SPECIAL_MAX_SPEED / speed;
+      ball.vx *= s;
+      ball.vy *= s;
+    }
+  }
+
+  function checkSpecialCollision() {
+    const special = balls.find(b => b.special);
+    if (!special) return false;
+    for (const other of balls) {
+      if (other === special) continue;
+      const dx = other.x - special.x, dy = other.y - special.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < other.r + special.r) return true;
+    }
+    return false;
+  }
+
+  // ---------- render ----------
+  function drawObstacle(obs) {
+    ctx.beginPath();
+    obs.points.forEach(([x, y], i) => {
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.closePath();
+    ctx.fillStyle = obs.fill;
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = obs.stroke;
+    ctx.stroke();
+  }
+
+  function drawFace(ball, sad) {
+    const r = ball.r;
+    const eyeY = ball.y - r * 0.25;
+    ctx.fillStyle = "#0b1220";
+    ctx.beginPath();
+    ctx.arc(ball.x - r * 0.35, eyeY, r * 0.13, 0, Math.PI * 2);
+    ctx.arc(ball.x + r * 0.35, eyeY, r * 0.13, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.lineWidth = Math.max(1.2, r * 0.16);
+    ctx.strokeStyle = "#0b1220";
+    ctx.lineCap = "round";
+    const mouthR = r * 0.42;
+    if (sad) {
+      ctx.arc(ball.x, ball.y + r * 0.6, mouthR, Math.PI, Math.PI * 2, false);
+    } else {
+      ctx.arc(ball.x, ball.y + r * 0.05, mouthR, 0, Math.PI, false);
+    }
+    ctx.stroke();
+  }
+
+  // Four distinct angry/mean faces for the four non-player balls, so
+  // every rival reads as its own little villain rather than a copy.
+  function drawAngryFace(ball, variant) {
+    const r = ball.r;
+    const x = ball.x, y = ball.y;
+    ctx.fillStyle = "#0b1220";
+    ctx.strokeStyle = "#0b1220";
+    ctx.lineCap = "round";
+    const eyeY = y - r * 0.15;
+    const eyeDX = r * 0.38;
+
+    if (variant === 0) {
+      // Classic fury: sharp V eyebrows, round glaring eyes, downturned frown
+      ctx.lineWidth = Math.max(1.1, r * 0.17);
+      ctx.beginPath();
+      ctx.moveTo(x - eyeDX - r * 0.25, eyeY - r * 0.08);
+      ctx.lineTo(x - eyeDX + r * 0.18, eyeY - r * 0.38);
+      ctx.moveTo(x + eyeDX + r * 0.25, eyeY - r * 0.08);
+      ctx.lineTo(x + eyeDX - r * 0.18, eyeY - r * 0.38);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(x - eyeDX, eyeY, r * 0.11, 0, Math.PI * 2);
+      ctx.arc(x + eyeDX, eyeY, r * 0.11, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.lineWidth = Math.max(1.1, r * 0.16);
+      ctx.arc(x, y + r * 0.62, r * 0.4, Math.PI, Math.PI * 2, false);
+      ctx.stroke();
+
+    } else if (variant === 1) {
+      // Sneering: wide angled-up eyebrows, squinted eyes, jagged bared-teeth mouth
+      ctx.lineWidth = Math.max(1.1, r * 0.17);
+      ctx.beginPath();
+      ctx.moveTo(x - eyeDX - r * 0.24, eyeY - r * 0.32);
+      ctx.lineTo(x - eyeDX + r * 0.2, eyeY - r * 0.08);
+      ctx.moveTo(x + eyeDX + r * 0.24, eyeY - r * 0.32);
+      ctx.lineTo(x + eyeDX - r * 0.2, eyeY - r * 0.08);
+      ctx.stroke();
+
+      ctx.lineWidth = Math.max(1, r * 0.12);
+      ctx.beginPath();
+      ctx.moveTo(x - eyeDX - r * 0.13, eyeY);
+      ctx.lineTo(x - eyeDX + r * 0.13, eyeY);
+      ctx.moveTo(x + eyeDX - r * 0.13, eyeY);
+      ctx.lineTo(x + eyeDX + r * 0.13, eyeY);
+      ctx.stroke();
+
+      const my = y + r * 0.55, mw = r * 0.45;
+      ctx.lineWidth = Math.max(1, r * 0.12);
+      ctx.beginPath();
+      ctx.moveTo(x - mw, my);
+      ctx.lineTo(x - mw * 0.5, my + r * 0.16);
+      ctx.lineTo(x, my - r * 0.02);
+      ctx.lineTo(x + mw * 0.5, my + r * 0.16);
+      ctx.lineTo(x + mw, my);
+      ctx.stroke();
+
+    } else if (variant === 2) {
+      // Grumpy glare: thick low brows almost on the eyes, narrow slits, flat mouth
+      ctx.lineWidth = Math.max(1.3, r * 0.2);
+      ctx.beginPath();
+      ctx.moveTo(x - eyeDX - r * 0.22, eyeY - r * 0.2);
+      ctx.lineTo(x - eyeDX + r * 0.22, eyeY - r * 0.2);
+      ctx.moveTo(x + eyeDX - r * 0.22, eyeY - r * 0.2);
+      ctx.lineTo(x + eyeDX + r * 0.22, eyeY - r * 0.2);
+      ctx.stroke();
+
+      ctx.lineWidth = Math.max(1, r * 0.11);
+      ctx.beginPath();
+      ctx.moveTo(x - eyeDX - r * 0.14, eyeY + r * 0.02);
+      ctx.lineTo(x - eyeDX + r * 0.14, eyeY + r * 0.02);
+      ctx.moveTo(x + eyeDX - r * 0.14, eyeY + r * 0.02);
+      ctx.lineTo(x + eyeDX + r * 0.14, eyeY + r * 0.02);
+      ctx.stroke();
+
+      ctx.lineWidth = Math.max(1.2, r * 0.16);
+      ctx.beginPath();
+      ctx.moveTo(x - r * 0.38, y + r * 0.6);
+      ctx.lineTo(x + r * 0.38, y + r * 0.6);
+      ctx.stroke();
+
+    } else {
+      // Devious smirk: mismatched eyebrows and eyes, crooked one-sided smirk
+      ctx.lineWidth = Math.max(1.1, r * 0.17);
+      ctx.beginPath();
+      ctx.moveTo(x - eyeDX - r * 0.22, eyeY - r * 0.1);
+      ctx.lineTo(x - eyeDX + r * 0.2, eyeY - r * 0.35);
+      ctx.moveTo(x + eyeDX + r * 0.24, eyeY - r * 0.3);
+      ctx.lineTo(x + eyeDX - r * 0.2, eyeY - r * 0.12);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(x - eyeDX, eyeY, r * 0.11, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.lineWidth = Math.max(1, r * 0.1);
+      ctx.beginPath();
+      ctx.moveTo(x + eyeDX - r * 0.12, eyeY);
+      ctx.lineTo(x + eyeDX + r * 0.12, eyeY);
+      ctx.stroke();
+
+      ctx.lineWidth = Math.max(1.1, r * 0.15);
+      ctx.beginPath();
+      ctx.moveTo(x - r * 0.3, y + r * 0.5);
+      ctx.quadraticCurveTo(x + r * 0.05, y + r * 0.72, x + r * 0.4, y + r * 0.42);
+      ctx.stroke();
+    }
+  }
+
+  function drawPellet(p) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+    ctx.fillStyle = "#fde68a";
+    ctx.shadowColor = "#fde68a";
+    ctx.shadowBlur = 8;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  function drawPopups(now) {
+    if (!popups.length) return;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = "bold 14px -apple-system, BlinkMacSystemFont, monospace";
+    for (const p of popups) {
+      const t = Math.min(1, (now - p.born) / POPUP_LIFE);
+      ctx.fillStyle = `rgba(253,230,138,${(1 - t).toFixed(3)})`;
+      ctx.fillText(p.text, p.x, p.y - t * 26);
+    }
+  }
+
+  function drawBall(ball) {
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+    ctx.fillStyle = ball.color;
+    ctx.shadowColor = ball.color;
+    ctx.shadowBlur = 12;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    if (ball.special) {
+      drawFace(ball, gameOver);
+    } else {
+      drawAngryFace(ball, ball.faceVariant);
+    }
+  }
+
+  function drawHud() {
+    ctx.fillStyle = "rgba(11,18,32,0.55)";
+    ctx.fillRect(10, 10, 150, 44);
+    ctx.fillRect(W - 160, 10, 150, 44);
+
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = "#8ea0bd";
+    ctx.font = "10px -apple-system, BlinkMacSystemFont, sans-serif";
+    ctx.fillText("DISTANCE", 20, 16);
+    ctx.fillStyle = "#38bdf8";
+    ctx.font = "bold 18px -apple-system, BlinkMacSystemFont, monospace";
+    ctx.fillText(pad(distance), 20, 30);
+
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#8ea0bd";
+    ctx.font = "10px -apple-system, BlinkMacSystemFont, sans-serif";
+    ctx.fillText("TIME", W - 20, 16);
+    ctx.fillStyle = "#facc15";
+    ctx.font = "bold 18px -apple-system, BlinkMacSystemFont, monospace";
+    ctx.fillText(pad(timeSurvived) + "s", W - 20, 30);
+
+    // live SCORE (distance x time) + persistent best, shown continuously
+    // while playing rather than only at game over
+    const boxW = 200, boxH = 54, bx = W / 2 - boxW / 2, by = 10;
+    ctx.fillStyle = "rgba(11,18,32,0.55)";
+    ctx.fillRect(bx, by, boxW, boxH);
+
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#8ea0bd";
+    ctx.font = "10px -apple-system, BlinkMacSystemFont, sans-serif";
+    ctx.fillText("SCORE", W / 2, by + 6);
+
+    ctx.fillStyle = "#f472b6";
+    ctx.font = "bold 20px -apple-system, BlinkMacSystemFont, monospace";
+    ctx.fillText(pad(score, 6), W / 2, by + 20);
+
+    ctx.fillStyle = "#8ea0bd";
+    ctx.font = "10px -apple-system, BlinkMacSystemFont, sans-serif";
+    ctx.fillText("best " + pad(bestScore, 6), W / 2, by + 40);
+  }
+
+  function drawGameOver() {
+    ctx.fillStyle = "rgba(11,18,32,0.82)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    ctx.fillStyle = "#f87171";
+    ctx.font = "bold 40px -apple-system, BlinkMacSystemFont, sans-serif";
+    ctx.fillText("GAME OVER", W / 2, H / 2 - 92);
+
+    ctx.font = "bold 17px -apple-system, BlinkMacSystemFont, monospace";
+    ctx.fillStyle = "#38bdf8";
+    ctx.fillText(
+      "DISTANCE " + pad(distance) + (newBestDistance ? "   ★ NEW BEST" : "   best " + pad(bestDistance)),
+      W / 2, H / 2 - 48
+    );
+    ctx.fillStyle = "#facc15";
+    ctx.fillText(
+      "TIME " + pad(timeSurvived) + "s" + (newBestTime ? "   ★ NEW BEST" : "   best " + pad(bestTime) + "s"),
+      W / 2, H / 2 - 18
+    );
+    ctx.fillStyle = "#f472b6";
+    ctx.fillText(
+      "SCORE " + pad(score, 6) + (newBestScore ? "   ★ NEW BEST" : "   best " + pad(bestScore, 6)),
+      W / 2, H / 2 + 12
+    );
+
+    ctx.fillStyle = "#f1f5f9";
+    ctx.font = "14px -apple-system, BlinkMacSystemFont, sans-serif";
+    ctx.fillText("Resetting...", W / 2, H / 2 + 52);
+  }
+
+  function render(now) {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "#0f172a";
+    ctx.fillRect(0, 0, W, H);
+    obstacles.forEach(drawObstacle);
+    if (!gameOver) pellets.forEach(drawPellet);
+    balls.forEach(drawBall);
+    if (gameOver) {
+      drawGameOver();
+    } else {
+      drawHud();
+      drawPopups(now);
+    }
+  }
+
+  // ---------- loop ----------
+  let last = performance.now();
+  function tick(now) {
+    let dt = (now - last) / 1000;
+    dt = Math.min(dt, 0.033); // clamp to avoid big jumps on tab switch
+    last = now;
+
+    if (gameOver) {
+      if (now >= gameOverUntil) {
+        gameOver = false;
+        balls = initBalls();
+        obstacles = generateObstacles();
+        pellets = generatePellets();
+        popups = [];
+        // release any held joystick drag so a finger resting on the stick
+        // from the previous life doesn't hand Zippy instant full thrust
+        // the moment the new life starts
+        joyPointerId = null;
+        touch.x = 0;
+        touch.y = 0;
+        setHandle(0, 0);
+        graceUntil = now + SPAWN_GRACE_MS;
+        distance = 0;
+        timeSurvived = 0;
+        pelletScore = 0;
+        score = 0;
+        newBestDistance = false;
+        newBestTime = false;
+        newBestScore = false;
+      }
+    } else {
+      timeSurvived += dt;
+      for (const ball of balls) {
+        if (ball.special) {
+          applyPlayerControl(ball, dt);
+        }
+        ball.x += ball.vx * dt;
+        ball.y += ball.vy * dt;
+        resolveObstacleCollisions(ball);
+        resolveWallCollisions(ball);
+        if (ball.special) {
+          distance += Math.hypot(ball.vx, ball.vy) * dt;
+        } else {
+          clampSpeed(ball, enemySpeedNow());
+        }
+      }
+
+      // Pacman-style pellet pickups: a flat, significant bonus straight into score
+      if (pellets.length) {
+        const special = balls.find(b => b.special);
+        if (special) {
+          for (const p of pellets) {
+            if (p.collected) continue;
+            if (Math.hypot(special.x - p.x, special.y - p.y) < special.r + p.r) {
+              p.collected = true;
+              pelletScore += PELLET_BONUS;
+              popups.push({ x: p.x, y: p.y, text: "+" + PELLET_BONUS, born: now });
+            }
+          }
+          pellets = pellets.filter(p => !p.collected);
+        }
+      }
+      popups = popups.filter(p => now - p.born < POPUP_LIFE);
+
+      score = distance * timeSurvived + pelletScore;
+      if (now >= graceUntil && checkSpecialCollision()) {
+        gameOver = true;
+        gameOverUntil = now + GAME_OVER_MS;
+        if (distance > bestDistance) { bestDistance = distance; newBestDistance = true; }
+        if (timeSurvived > bestTime) { bestTime = timeSurvived; newBestTime = true; }
+        if (score > bestScore) { bestScore = score; newBestScore = true; }
+        if (newBestDistance || newBestTime || newBestScore) saveBest(bestDistance, bestTime, bestScore);
+      }
+    }
+
+    render(now);
+    requestAnimationFrame(tick);
+  }
+
+  render(performance.now());
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
