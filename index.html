@@ -131,7 +131,7 @@
 <body>
 <header>
   <h1>ZIPPY</h1>
-  <p class="tagline">Build 8 &middot; wave pellets, randomized obstacles, mobile-friendly layout</p>
+  <p class="tagline">Build 9 &middot; dense pellet fields, randomized obstacles, mobile-friendly layout</p>
   <p class="hint">WASD (or drag the joystick below on touch) to fly Zippy around the arena</p>
 </header>
 <div class="stage-wrap">
@@ -165,7 +165,7 @@
   const SPECIAL_FRICTION = 3.5;  // higher = stops faster when keys are released
 
   const PELLET_RADIUS = 5;
-  const PELLET_COUNT = 10;   // pellets sown along the wave each life (some may be skipped if they'd land on an obstacle/HUD box)
+  const PELLET_COUNT = 10;   // pellets sown per wave pass (5 wave passes per life - see PELLET_WAVE_COUNT below)
   const PELLET_BONUS = 500;  // flat points added to score per pellet collected
   const POPUP_LIFE = 700;    // ms a "+500" pickup popup stays on screen
 
@@ -301,9 +301,13 @@
   let obstacles = generateObstacles();
 
   // ---------- pellets ----------
-  // Pacman-style bonus pellets, sown along a randomly chosen sine, cosine
-  // or tangent wave across the arena. Each one is a flat, significant
-  // point bonus the moment Zippy touches it - re-rolled every life.
+  // Pacman-style bonus pellets, sown along randomly chosen sine, cosine
+  // and tangent waves across the arena (several waves layered together
+  // for a big field of pellets). Each one is a flat, significant point
+  // bonus the moment Zippy touches it - re-rolled every life.
+  const PELLET_WAVE_COUNT = 5; // separate wave passes layered per life
+  const PELLET_PLACEMENT_ATTEMPTS = 8; // random-relocation retries before giving up on a pellet
+
   function tooCloseToObstacle(x, y, margin) {
     for (const obs of obstacles) {
       for (const [a, b] of obs.edges) {
@@ -322,7 +326,23 @@
     return false;
   }
 
-  function generatePellets() {
+  // a pellet is never allowed to sit inside a bounce-shape (or the HUD);
+  // if its wave position lands there, it gets re-rolled to a fresh random
+  // spot on the field instead of just being skipped
+  function placePellet(x, y, out) {
+    let px = x, py = y;
+    let attempts = 0;
+    while ((tooCloseToObstacle(px, py, PELLET_RADIUS + 6) || inHudZone(px, py)) && attempts < PELLET_PLACEMENT_ATTEMPTS) {
+      px = randRange(30, W - 30);
+      py = randRange(85, H - 20);
+      attempts++;
+    }
+    if (!tooCloseToObstacle(px, py, PELLET_RADIUS + 6) && !inHudZone(px, py)) {
+      out.push({ x: px, y: py, r: PELLET_RADIUS, collected: false });
+    }
+  }
+
+  function generatePelletWave(out) {
     const waveType = pick(["sin", "cos", "tan"]);
     const amplitude = randRange(40, 90);
     const freq = randRange(1.5, 3.5);
@@ -330,7 +350,6 @@
     const baseY = randRange(150, 430);
     const marginX = 60;
     const usableW = W - marginX * 2;
-    const out = [];
     for (let i = 0; i < PELLET_COUNT; i++) {
       const t = i / (PELLET_COUNT - 1);
       const x = marginX + t * usableW;
@@ -341,9 +360,14 @@
       else raw = Math.max(-1, Math.min(1, Math.tan(theta) * 0.3)); // tan blows up near its asymptotes, so scale + clamp it
       let y = baseY + raw * amplitude;
       y = Math.max(85, Math.min(H - 20, y));
-      if (!tooCloseToObstacle(x, y, PELLET_RADIUS + 6) && !inHudZone(x, y)) {
-        out.push({ x, y, r: PELLET_RADIUS, collected: false });
-      }
+      placePellet(x, y, out);
+    }
+  }
+
+  function generatePellets() {
+    const out = [];
+    for (let wave = 0; wave < PELLET_WAVE_COUNT; wave++) {
+      generatePelletWave(out);
     }
     return out;
   }
