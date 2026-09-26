@@ -65,11 +65,6 @@
     aspect-ratio: 3 / 2;
     border-radius: 10px;
     background: #0f172a;
-    /* the initials-entry screen makes the canvas itself directly tappable
-       (see the pointerdown handler in the script), so it needs the same
-       touch-gesture opt-out as the joystick zone below */
-    touch-action: none;
-    -webkit-tap-highlight-color: transparent;
   }
   footer {
     color: var(--muted);
@@ -146,7 +141,7 @@
 <body>
 <header>
   <h1>ZIPPY</h1>
-  <p class="tagline">Build 13 &middot; easier tap-to-edit initials entry on mobile</p>
+  <p class="tagline">Build 12 &middot; global top 10 leaderboard with initials entry</p>
   <p class="hint">WASD (or drag the joystick below on touch) to fly Zippy around the arena</p>
 </header>
 <div class="stage-wrap">
@@ -260,14 +255,20 @@
   // is what actually avoids iOS's long-press "select/copy" callout.
   // While GAME OVER is showing, the same zone doubles as a "ready" tap
   // target instead - see the pointerdown handler and tryRespawn() below.
-  // (Initials entry no longer uses the joystick at all - see the canvas
-  // pointerdown handler further down, which lets the player tap the
-  // letters directly instead of fiddling with drag distances.)
   const touch = { x: 0, y: 0 }; // -1..1 per axis, magnitude <= 1
   const joyZone = document.getElementById("joystick");
   const joyHandle = joyZone ? joyZone.querySelector(".joystick-handle") : null;
   const joyLabel = joyZone ? joyZone.parentElement.querySelector(".joy-label") : null;
   let joyPointerId = null;
+
+  // Mobile equivalent of the W/A/S/D initials controls: drag up/down to
+  // cycle the active slot's letter, drag left/right to move slots, and a
+  // clean tap (little to no movement) confirms - see the pointerdown
+  // handler below and cycleInitialLetter()/moveInitialsSlot().
+  const INITIALS_DRAG_STEP = 18; // px of drag per letter/slot step
+  let initialsDragStartX = 0, initialsDragStartY = 0;
+  let initialsDragAccumX = 0, initialsDragAccumY = 0;
+  let initialsDragMoved = false;
 
   function setHandle(dx, dy) {
     if (joyHandle) joyHandle.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
@@ -276,6 +277,16 @@
   function joyMove(e) {
     if (joyPointerId === null || e.pointerId !== joyPointerId) return;
     e.preventDefault();
+    if (gameOver && gameOverPhase === "enterInitials") {
+      const dx = e.clientX - initialsDragStartX;
+      const dy = e.clientY - initialsDragStartY;
+      if (Math.abs(dx) > 6 || Math.abs(dy) > 6) initialsDragMoved = true;
+      while (dy - initialsDragAccumY < -INITIALS_DRAG_STEP) { cycleInitialLetter(1); initialsDragAccumY -= INITIALS_DRAG_STEP; }
+      while (dy - initialsDragAccumY > INITIALS_DRAG_STEP) { cycleInitialLetter(-1); initialsDragAccumY += INITIALS_DRAG_STEP; }
+      while (dx - initialsDragAccumX > INITIALS_DRAG_STEP) { moveInitialsSlot(1); initialsDragAccumX += INITIALS_DRAG_STEP; }
+      while (dx - initialsDragAccumX < -INITIALS_DRAG_STEP) { moveInitialsSlot(-1); initialsDragAccumX -= INITIALS_DRAG_STEP; }
+      return;
+    }
     const rect = joyZone.getBoundingClientRect();
     // max travel is read live from the zone's rendered size (rather than a
     // fixed px constant) so the mobile CSS media query, which shrinks the
@@ -294,6 +305,11 @@
   }
   function joyEnd(e) {
     if (joyPointerId === null || e.pointerId !== joyPointerId) return;
+    if (gameOver && gameOverPhase === "enterInitials") {
+      joyPointerId = null;
+      if (!initialsDragMoved) confirmInitialsSlot(); // a clean tap confirms the current slot
+      return;
+    }
     joyPointerId = null;
     touch.x = 0;
     touch.y = 0;
@@ -302,10 +318,23 @@
   if (joyZone) {
     joyZone.addEventListener("pointerdown", (e) => {
       e.preventDefault();
-      if (gameOver) {
-        if (gameOverPhase === "final") tryRespawn(performance.now()); // final score screen - this tap is a "ready" confirmation
-        return; // "checking"/"submitting"/"enterInitials" - joystick is inactive; edit initials by tapping the letters on screen
+      if (gameOver && gameOverPhase === "enterInitials") {
+        joyPointerId = e.pointerId;
+        joyZone.setPointerCapture(e.pointerId);
+        initialsDragStartX = e.clientX;
+        initialsDragStartY = e.clientY;
+        initialsDragAccumX = 0;
+        initialsDragAccumY = 0;
+        initialsDragMoved = false;
+        return;
       }
+      if (gameOver && gameOverPhase === "final") {
+        // final score screen is showing - this tap is a "ready" confirmation,
+        // not the start of a drag, so skip the joystick tracking below
+        tryRespawn(performance.now());
+        return;
+      }
+      if (gameOver) return; // "checking"/"submitting" - ignore taps while we talk to the leaderboard
       joyPointerId = e.pointerId;
       joyZone.setPointerCapture(e.pointerId);
       joyMove(e);
@@ -315,42 +344,6 @@
     joyZone.addEventListener("pointercancel", joyEnd);
     joyZone.addEventListener("contextmenu", (e) => e.preventDefault());
   }
-
-  // ---------- input (tap-to-edit initials, directly on the canvas) ----------
-  // The initials-entry screen draws 3 letter boxes, each with its own
-  // up/down carets, plus a big CONFIRM button (see drawInitialsEntry() and
-  // getInitialsLayout() below). Tapping a box's top half bumps that letter
-  // up, its bottom half bumps it down - any box, any time, no need to
-  // "move" to it first - and tapping CONFIRM submits immediately. This
-  // replaces an earlier drag-distance-based scheme that was fiddly to hit
-  // precisely on a small screen; direct taps on visible targets are much
-  // easier to land on mobile. Keyboard entry (W/S/A/D/SPACE) is untouched.
-  canvas.addEventListener("pointerdown", (e) => {
-    if (!(gameOver && gameOverPhase === "enterInitials")) return;
-    e.preventDefault();
-    const rect = canvas.getBoundingClientRect();
-    const lx = (e.clientX - rect.left) / rect.width * W;
-    const ly = (e.clientY - rect.top) / rect.height * H;
-    const layout = getInitialsLayout();
-    for (const box of layout.boxes) {
-      if (lx < box.x - INITIALS_TAP_PAD_X || lx > box.x + box.w + INITIALS_TAP_PAD_X) continue;
-      const midY = box.y + box.h / 2;
-      if (ly >= box.y - INITIALS_CARET_PAD && ly < midY) {
-        initialsSlot = box.i;
-        cycleInitialLetterAt(box.i, 1);
-        return;
-      }
-      if (ly >= midY && ly <= box.y + box.h + INITIALS_CARET_PAD) {
-        initialsSlot = box.i;
-        cycleInitialLetterAt(box.i, -1);
-        return;
-      }
-    }
-    const c = layout.confirmRect;
-    if (lx >= c.x && lx <= c.x + c.w && ly >= c.y && ly <= c.y + c.h) {
-      finalizeHighScore();
-    }
-  });
 
   // ---------- geometry helpers ----------
   // Irregular, jagged polygon generator used for obstacles. Each vertex
@@ -773,8 +766,8 @@
       return;
     }
     if (gameOverPhase === "enterInitials") {
-      if (joyLabel) joyLabel.textContent = "Tap the letters above to edit";
-      if (joyZone) joyZone.classList.remove("confirm-mode");
+      if (joyLabel) joyLabel.textContent = "Drag = letter/slot · Tap = confirm";
+      if (joyZone) joyZone.classList.add("confirm-mode");
     } else if (gameOverPhase === "final") {
       if (joyLabel) joyLabel.textContent = "Tap to continue";
       if (joyZone) joyZone.classList.add("confirm-mode");
@@ -784,41 +777,15 @@
     }
   }
 
-  function cycleInitialLetterAt(idx, dir) {
-    const A = "A".charCodeAt(0);
-    let c = initialsChars[idx].charCodeAt(0) - A;
-    c = (c + dir + 26) % 26;
-    initialsChars[idx] = String.fromCharCode(A + c);
-  }
-
   function cycleInitialLetter(dir) {
-    cycleInitialLetterAt(initialsSlot, dir);
+    const A = "A".charCodeAt(0);
+    let idx = initialsChars[initialsSlot].charCodeAt(0) - A;
+    idx = (idx + dir + 26) % 26;
+    initialsChars[initialsSlot] = String.fromCharCode(A + idx);
   }
 
   function moveInitialsSlot(dir) {
     initialsSlot = Math.max(0, Math.min(2, initialsSlot + dir));
-  }
-
-  // Fixed layout for the 3 initials boxes + the CONFIRM button on the
-  // initials-entry screen - computed from constants only (never from
-  // per-run state), so drawInitialsEntry() and the canvas pointerdown
-  // handler above always agree on exactly where each tap target is.
-  const INITIALS_BOX_W = 60, INITIALS_BOX_GAP = 16;
-  const INITIALS_CONFIRM_W = 180, INITIALS_CONFIRM_H = 46;
-  const INITIALS_CARET_PAD = 26; // extra px above/below each box counted as part of its tap zone
-  const INITIALS_TAP_PAD_X = 8;  // extra px left/right of each box counted as part of its tap zone
-
-  function getInitialsLayout() {
-    const totalW = INITIALS_BOX_W * 3 + INITIALS_BOX_GAP * 2;
-    const startX = W / 2 - totalW / 2;
-    const boxY = H / 2 - 60; // matches the fixed vertical flow in drawInitialsEntry
-    const boxH = 64;
-    const boxes = [];
-    for (let i = 0; i < 3; i++) {
-      boxes.push({ i, x: startX + i * (INITIALS_BOX_W + INITIALS_BOX_GAP), y: boxY, w: INITIALS_BOX_W, h: boxH });
-    }
-    const confirmRect = { x: W / 2 - INITIALS_CONFIRM_W / 2, y: boxY + boxH + 46, w: INITIALS_CONFIRM_W, h: INITIALS_CONFIRM_H };
-    return { boxes, confirmRect };
   }
 
   function confirmInitialsSlot() {
@@ -1178,11 +1145,8 @@
   }
 
   // This run's score cracked the global top 10 - let the player pick 3
-  // initials. On a keyboard: W/S changes the active slot's letter, A/D
-  // moves which slot is active, SPACE confirms (advancing through all 3,
-  // then submitting). On touch: every box's own up/down carets are a
-  // direct tap target - no "active slot" concept needed - and a single
-  // big CONFIRM button submits whenever the player is happy with all 3.
+  // initials (W/S or drag up/down: letter, A/D or drag left/right: slot,
+  // SPACE or tap: confirm) before showing the settled score screen.
   function drawInitialsEntry() {
     ctx.fillStyle = "rgba(11,18,32,0.88)";
     ctx.fillRect(0, 0, W, H);
@@ -1200,43 +1164,36 @@
     ctx.fillText("SCORE " + pad(score, 6), W / 2, y);
     y += 56;
 
-    const layout = getInitialsLayout();
-    for (const box of layout.boxes) {
-      const active = box.i === initialsSlot;
+    const boxW = 60, boxGap = 16, totalW = boxW * 3 + boxGap * 2;
+    const startX = W / 2 - totalW / 2;
+    const boxY = y - 30, boxH = 64;
+    for (let i = 0; i < 3; i++) {
+      const bx = startX + i * (boxW + boxGap);
+      const active = i === initialsSlot;
       ctx.fillStyle = active ? "rgba(74,222,128,0.18)" : "rgba(255,255,255,0.06)";
-      ctx.fillRect(box.x, box.y, box.w, box.h);
+      ctx.fillRect(bx, boxY, boxW, boxH);
       ctx.lineWidth = active ? 3 : 1.5;
       ctx.strokeStyle = active ? "#4ade80" : "rgba(255,255,255,0.35)";
-      ctx.strokeRect(box.x, box.y, box.w, box.h);
+      ctx.strokeRect(bx, boxY, boxW, boxH);
 
       ctx.fillStyle = active ? "#4ade80" : "#f1f5f9";
       ctx.font = "bold 34px -apple-system, BlinkMacSystemFont, monospace";
-      ctx.fillText(initialsChars[box.i], box.x + box.w / 2, box.y + box.h / 2 + 2);
+      ctx.fillText(initialsChars[i], bx + boxW / 2, boxY + boxH / 2 + 2);
 
-      // carets are drawn on every box now, not just the active one, since
-      // each is its own independent tap target for touch
-      ctx.font = "bold 16px -apple-system, BlinkMacSystemFont, sans-serif";
-      ctx.fillStyle = active ? "#4ade80" : "rgba(241,245,249,0.5)";
-      ctx.fillText("▲", box.x + box.w / 2, box.y - 14);
-      ctx.fillText("▼", box.x + box.w / 2, box.y + box.h + 14);
+      if (active) {
+        ctx.font = "bold 16px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillStyle = "#4ade80";
+        ctx.fillText("▲", bx + boxW / 2, boxY - 14);
+        ctx.fillText("▼", bx + boxW / 2, boxY + boxH + 14);
+      }
     }
+    y = boxY + boxH + 46;
 
-    const c = layout.confirmRect;
-    ctx.fillStyle = "rgba(74,222,128,0.22)";
-    ctx.fillRect(c.x, c.y, c.w, c.h);
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = "#4ade80";
-    ctx.strokeRect(c.x, c.y, c.w, c.h);
-    ctx.fillStyle = "#4ade80";
-    ctx.font = "bold 18px -apple-system, BlinkMacSystemFont, sans-serif";
-    ctx.fillText("✓ CONFIRM", c.x + c.w / 2, c.y + c.h / 2 + 1);
-
-    y = c.y + c.h + 30;
     ctx.fillStyle = "#8ea0bd";
     ctx.font = "13px -apple-system, BlinkMacSystemFont, sans-serif";
-    ctx.fillText("Tap ▲/▼ on a letter to change it, tap CONFIRM when ready", W / 2, y);
+    ctx.fillText("W/S or drag up/down: change letter · A/D or drag left/right: move", W / 2, y);
     y += 20;
-    ctx.fillText("Keyboard: W/S change letter · A/D move · SPACE confirms", W / 2, y);
+    ctx.fillText("SPACE or tap: confirm letter, then confirm again to save", W / 2, y);
   }
 
   // Settled game-over screen: stats plus the live global top-10 board.
