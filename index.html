@@ -200,7 +200,7 @@
   // hobby leaderboard, but nothing stops someone from writing to it
   // directly if they found the URL, and it isn't guaranteed to be
   // permanent (no SLA from the free service).
-  const LEADERBOARD_URL = "https://json.extendsclass.com/bin/fb444c2fd6d6";
+  const LEADERBOARD_URL = "https://json.extendsclass.com/bin/3e101eb0a004";
   const LEADERBOARD_SIZE = 10;
   const LEADERBOARD_FETCH_TIMEOUT_MS = 6000;
 
@@ -1324,7 +1324,6 @@
     requestAnimationFrame(tick);
   }
 
-  fetchHighScores(); // warm the cache on load, so the first "checking" screen is more likely already fresh
   render(performance.now());
   requestAnimationFrame(tick);
 })();
