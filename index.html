@@ -141,7 +141,7 @@
 <body>
 <header>
   <h1>ZIPPY</h1>
-  <p class="tagline">Build 11 &middot; bigger arena, diamond Zippy with a halo</p>
+  <p class="tagline">Build 12 &middot; global top 10 leaderboard with initials entry</p>
   <p class="hint">WASD (or drag the joystick below on touch) to fly Zippy around the arena</p>
 </header>
 <div class="stage-wrap">
@@ -191,6 +191,19 @@
   const PELLET_BONUS = 500;  // flat points added to score per pellet collected
   const POPUP_LIFE = 700;    // ms a "+500" pickup popup stays on screen
 
+  // ---------- global leaderboard ----------
+  // A free, no-login shared JSON bin (json.extendsclass.com) holds the top
+  // scores for every player, not just this browser. GET/PUT both work
+  // cross-origin with no auth on this specific bin, which is exactly what a
+  // static GitHub Pages site needs since it can't run its own backend.
+  // Note this is an informal, unauthenticated store - fine for a small
+  // hobby leaderboard, but nothing stops someone from writing to it
+  // directly if they found the URL, and it isn't guaranteed to be
+  // permanent (no SLA from the free service).
+  const LEADERBOARD_URL = "https://json.extendsclass.com/bin/fb444c2fd6d6";
+  const LEADERBOARD_SIZE = 10;
+  const LEADERBOARD_FETCH_TIMEOUT_MS = 6000;
+
   // ---------- input (keyboard) ----------
   const keys = { w: false, a: false, s: false, d: false };
   window.addEventListener("keydown", (e) => {
@@ -202,15 +215,36 @@
     if (k in keys) { keys[k] = false; e.preventDefault(); }
   });
 
-  // Spacebar is the PC "ready" input once GAME OVER is showing - see
-  // tryRespawn() below. Always prevent the page-scroll default for Space
-  // (it has no other use here); e.repeat is ignored so holding the key
-  // down doesn't fire a respawn attempt over and over.
+  // Spacebar does double duty once GAME OVER is showing: it confirms the
+  // current initials slot while entering a top-10 score, or it's the PC
+  // "ready" input once the final score screen is up - see
+  // confirmInitialsSlot()/tryRespawn() below. Always prevent the
+  // page-scroll default for Space (it has no other use here); e.repeat is
+  // ignored so holding the key down doesn't repeat the action.
   window.addEventListener("keydown", (e) => {
     if (e.code === "Space" || e.key === " ") {
       e.preventDefault();
-      if (!e.repeat) tryRespawn(performance.now());
+      if (e.repeat) return;
+      if (gameOver && gameOverPhase === "enterInitials") {
+        confirmInitialsSlot();
+      } else if (gameOver && gameOverPhase === "final") {
+        tryRespawn(performance.now());
+      }
+      // "checking"/"submitting" - ignore input while we talk to the leaderboard
     }
+  });
+
+  // While entering initials, W/S (or the up/down arrows) cycle the active
+  // slot's letter A-Z and A/D (or left/right) move which of the 3 slots is
+  // active. These reuse the same physical keys as movement, but movement
+  // is already frozen while gameOver is true, so there's no conflict.
+  window.addEventListener("keydown", (e) => {
+    if (!(gameOver && gameOverPhase === "enterInitials")) return;
+    const k = e.key.toLowerCase();
+    if (k === "w" || k === "arrowup") { e.preventDefault(); cycleInitialLetter(1); }
+    else if (k === "s" || k === "arrowdown") { e.preventDefault(); cycleInitialLetter(-1); }
+    else if (k === "a" || k === "arrowleft") { e.preventDefault(); if (!e.repeat) moveInitialsSlot(-1); }
+    else if (k === "d" || k === "arrowright") { e.preventDefault(); if (!e.repeat) moveInitialsSlot(1); }
   });
 
   // ---------- input (touch joystick) ----------
@@ -227,6 +261,15 @@
   const joyLabel = joyZone ? joyZone.parentElement.querySelector(".joy-label") : null;
   let joyPointerId = null;
 
+  // Mobile equivalent of the W/A/S/D initials controls: drag up/down to
+  // cycle the active slot's letter, drag left/right to move slots, and a
+  // clean tap (little to no movement) confirms - see the pointerdown
+  // handler below and cycleInitialLetter()/moveInitialsSlot().
+  const INITIALS_DRAG_STEP = 18; // px of drag per letter/slot step
+  let initialsDragStartX = 0, initialsDragStartY = 0;
+  let initialsDragAccumX = 0, initialsDragAccumY = 0;
+  let initialsDragMoved = false;
+
   function setHandle(dx, dy) {
     if (joyHandle) joyHandle.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
   }
@@ -234,6 +277,16 @@
   function joyMove(e) {
     if (joyPointerId === null || e.pointerId !== joyPointerId) return;
     e.preventDefault();
+    if (gameOver && gameOverPhase === "enterInitials") {
+      const dx = e.clientX - initialsDragStartX;
+      const dy = e.clientY - initialsDragStartY;
+      if (Math.abs(dx) > 6 || Math.abs(dy) > 6) initialsDragMoved = true;
+      while (dy - initialsDragAccumY < -INITIALS_DRAG_STEP) { cycleInitialLetter(1); initialsDragAccumY -= INITIALS_DRAG_STEP; }
+      while (dy - initialsDragAccumY > INITIALS_DRAG_STEP) { cycleInitialLetter(-1); initialsDragAccumY += INITIALS_DRAG_STEP; }
+      while (dx - initialsDragAccumX > INITIALS_DRAG_STEP) { moveInitialsSlot(1); initialsDragAccumX += INITIALS_DRAG_STEP; }
+      while (dx - initialsDragAccumX < -INITIALS_DRAG_STEP) { moveInitialsSlot(-1); initialsDragAccumX -= INITIALS_DRAG_STEP; }
+      return;
+    }
     const rect = joyZone.getBoundingClientRect();
     // max travel is read live from the zone's rendered size (rather than a
     // fixed px constant) so the mobile CSS media query, which shrinks the
@@ -252,6 +305,11 @@
   }
   function joyEnd(e) {
     if (joyPointerId === null || e.pointerId !== joyPointerId) return;
+    if (gameOver && gameOverPhase === "enterInitials") {
+      joyPointerId = null;
+      if (!initialsDragMoved) confirmInitialsSlot(); // a clean tap confirms the current slot
+      return;
+    }
     joyPointerId = null;
     touch.x = 0;
     touch.y = 0;
@@ -260,12 +318,23 @@
   if (joyZone) {
     joyZone.addEventListener("pointerdown", (e) => {
       e.preventDefault();
-      if (gameOver) {
-        // GAME OVER is showing - this tap is a "ready" confirmation, not
-        // the start of a drag, so skip the joystick tracking below
+      if (gameOver && gameOverPhase === "enterInitials") {
+        joyPointerId = e.pointerId;
+        joyZone.setPointerCapture(e.pointerId);
+        initialsDragStartX = e.clientX;
+        initialsDragStartY = e.clientY;
+        initialsDragAccumX = 0;
+        initialsDragAccumY = 0;
+        initialsDragMoved = false;
+        return;
+      }
+      if (gameOver && gameOverPhase === "final") {
+        // final score screen is showing - this tap is a "ready" confirmation,
+        // not the start of a drag, so skip the joystick tracking below
         tryRespawn(performance.now());
         return;
       }
+      if (gameOver) return; // "checking"/"submitting" - ignore taps while we talk to the leaderboard
       joyPointerId = e.pointerId;
       joyZone.setPointerCapture(e.pointerId);
       joyMove(e);
@@ -513,6 +582,81 @@
   let gameOverAt = 0;
   let graceUntil = 0;
 
+  // ---------- global leaderboard (top 10, shared across every player) ----------
+  // gameOverPhase tracks where we are on the GAME OVER screen:
+  //   "checking"      - just died, fetching the live global list to see if
+  //                      this run's score makes the top 10
+  //   "enterInitials" - it does; player is picking 3 letters
+  //   "submitting"    - initials confirmed, writing the new entry back
+  //   "final"         - settled; showing stats + the top-10 board, waiting
+  //                      for the "ready" input to respawn
+  let gameOverPhase = "final";
+  let highScores = [];        // cached global top-10, refreshed on load and after every death
+  let highScoresError = false; // last fetch/submit to the shared store failed - shown as a small note, never blocks play
+  let initialsChars = ["A", "A", "A"];
+  let initialsSlot = 0;
+  let lastQualifyingEntry = null; // the entry this life just added, so it can be highlighted in the list
+
+  async function fetchWithTimeout(url, options) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LEADERBOARD_FETCH_TIMEOUT_MS);
+    try {
+      return await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Refreshes the cached global top-10 from the shared store. Best-effort:
+  // on any failure (offline, timeout, bad data) it just leaves the existing
+  // cache in place and flags highScoresError, rather than blocking play.
+  async function fetchHighScores() {
+    try {
+      const resp = await fetchWithTimeout(LEADERBOARD_URL, { cache: "no-store" });
+      if (!resp.ok) throw new Error("bad status " + resp.status);
+      const data = await resp.json();
+      if (Array.isArray(data)) {
+        highScores = data
+          .filter(e => e && typeof e.score === "number" && typeof e.initials === "string")
+          .map(e => ({ initials: e.initials.slice(0, 3).toUpperCase(), score: e.score }))
+          .sort((a, b) => b.score - a.score)
+          .slice(0, LEADERBOARD_SIZE);
+      }
+      highScoresError = false;
+    } catch (e) {
+      highScoresError = true;
+    }
+  }
+
+  function qualifiesForHighScore(candidateScore) {
+    return highScores.length < LEADERBOARD_SIZE || candidateScore > highScores[highScores.length - 1].score;
+  }
+
+  // Re-fetches the freshest list, merges the new entry in, and writes the
+  // result back - the re-fetch-then-merge is a light best-effort defense
+  // against two players submitting at almost the same moment, though with
+  // an unauthenticated shared bin a rare lost update is still possible
+  // (acceptable for a casual hobby leaderboard).
+  async function submitHighScore(entry) {
+    await fetchHighScores();
+    const merged = highScores.concat([entry]).sort((a, b) => b.score - a.score).slice(0, LEADERBOARD_SIZE);
+    try {
+      const resp = await fetchWithTimeout(LEADERBOARD_URL, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(merged)
+      });
+      if (!resp.ok) throw new Error("bad status " + resp.status);
+      highScores = merged;
+      highScoresError = false;
+    } catch (e) {
+      // couldn't reach the shared store - still show the entry locally so
+      // the player sees their score placed, even though it didn't save
+      highScores = merged;
+      highScoresError = true;
+    }
+  }
+
   // ---------- collision helpers ----------
   function closestPointOnSegment(px, py, ax, ay, bx, by) {
     const abx = bx - ax, aby = by - ay;
@@ -609,24 +753,67 @@
     return false;
   }
 
-  // ---------- ready / respawn ----------
+  // ---------- ready / respawn / initials entry ----------
   // GAME OVER now waits indefinitely for the player to confirm they're
   // ready (spacebar on PC, or a tap on the joystick zone on touch) rather
-  // than auto-continuing after a fixed timer.
+  // than auto-continuing after a fixed timer - but first, if this run's
+  // score makes the global top 10, it detours through an initials-entry
+  // screen. See gameOverPhase above for the state machine.
   function updateJoyUiForState() {
-    if (gameOver) {
+    if (!gameOver) {
+      if (joyLabel) joyLabel.textContent = "Drag to steer";
+      if (joyZone) joyZone.classList.remove("confirm-mode");
+      return;
+    }
+    if (gameOverPhase === "enterInitials") {
+      if (joyLabel) joyLabel.textContent = "Drag = letter/slot · Tap = confirm";
+      if (joyZone) joyZone.classList.add("confirm-mode");
+    } else if (gameOverPhase === "final") {
       if (joyLabel) joyLabel.textContent = "Tap to continue";
       if (joyZone) joyZone.classList.add("confirm-mode");
     } else {
-      if (joyLabel) joyLabel.textContent = "Drag to steer";
+      if (joyLabel) joyLabel.textContent = "Please wait…";
       if (joyZone) joyZone.classList.remove("confirm-mode");
     }
   }
 
+  function cycleInitialLetter(dir) {
+    const A = "A".charCodeAt(0);
+    let idx = initialsChars[initialsSlot].charCodeAt(0) - A;
+    idx = (idx + dir + 26) % 26;
+    initialsChars[initialsSlot] = String.fromCharCode(A + idx);
+  }
+
+  function moveInitialsSlot(dir) {
+    initialsSlot = Math.max(0, Math.min(2, initialsSlot + dir));
+  }
+
+  function confirmInitialsSlot() {
+    if (gameOverPhase !== "enterInitials") return;
+    if (initialsSlot < 2) {
+      initialsSlot++;
+    } else {
+      finalizeHighScore();
+    }
+  }
+
+  async function finalizeHighScore() {
+    const entry = { initials: initialsChars.join(""), score: Math.round(score) };
+    lastQualifyingEntry = entry;
+    gameOverPhase = "submitting";
+    updateJoyUiForState();
+    await submitHighScore(entry);
+    if (!gameOver) return; // player somehow already moved on - don't stomp new state
+    gameOverPhase = "final";
+    updateJoyUiForState();
+  }
+
   function tryRespawn(now) {
-    if (!gameOver) return;
+    if (!gameOver || gameOverPhase !== "final") return;
     if (now - gameOverAt < READY_INPUT_DELAY_MS) return; // ignore input in the first instant so the score is readable and can't be skipped by accident
     gameOver = false;
+    gameOverPhase = "final";
+    lastQualifyingEntry = null;
     balls = initBalls();
     obstacles = generateObstacles();
     pellets = generatePellets();
@@ -909,36 +1096,137 @@
     ctx.fillText("best " + pad(bestScore, 6), W / 2, by + 40);
   }
 
-  function drawGameOver() {
-    ctx.fillStyle = "rgba(11,18,32,0.82)";
-    ctx.fillRect(0, 0, W, H);
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
+  // Shared "GAME OVER" title + DISTANCE/TIME/SCORE lines, used by every
+  // phase of the game-over screen; returns the y cursor so each phase can
+  // keep drawing its own content below it.
+  function drawGameOverStatsBlock() {
+    let y = H / 2 - 132;
 
     ctx.fillStyle = "#f87171";
     ctx.font = "bold 40px -apple-system, BlinkMacSystemFont, sans-serif";
-    ctx.fillText("GAME OVER", W / 2, H / 2 - 92);
+    ctx.fillText("GAME OVER", W / 2, y);
+    y += 44;
 
     ctx.font = "bold 17px -apple-system, BlinkMacSystemFont, monospace";
     ctx.fillStyle = "#38bdf8";
     ctx.fillText(
       "DISTANCE " + pad(distance) + (newBestDistance ? "   ★ NEW BEST" : "   best " + pad(bestDistance)),
-      W / 2, H / 2 - 48
+      W / 2, y
     );
+    y += 26;
     ctx.fillStyle = "#facc15";
     ctx.fillText(
       "TIME " + pad(timeSurvived) + "s" + (newBestTime ? "   ★ NEW BEST" : "   best " + pad(bestTime) + "s"),
-      W / 2, H / 2 - 18
+      W / 2, y
     );
+    y += 26;
     ctx.fillStyle = "#f472b6";
     ctx.fillText(
       "SCORE " + pad(score, 6) + (newBestScore ? "   ★ NEW BEST" : "   best " + pad(bestScore, 6)),
-      W / 2, H / 2 + 12
+      W / 2, y
     );
+    y += 30;
+    return y;
+  }
+
+  // "checking" (just died, talking to the leaderboard) and "submitting"
+  // (initials confirmed, writing the entry) look the same - stats plus a
+  // single status line - so they share this one draw function.
+  function drawGameOverBusy(message) {
+    ctx.fillStyle = "rgba(11,18,32,0.82)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    let y = drawGameOverStatsBlock();
+    y += 16;
+    ctx.fillStyle = "#8ea0bd";
+    ctx.font = "14px -apple-system, BlinkMacSystemFont, sans-serif";
+    ctx.fillText(message, W / 2, y);
+  }
+
+  // This run's score cracked the global top 10 - let the player pick 3
+  // initials (W/S or drag up/down: letter, A/D or drag left/right: slot,
+  // SPACE or tap: confirm) before showing the settled score screen.
+  function drawInitialsEntry() {
+    ctx.fillStyle = "rgba(11,18,32,0.88)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    let y = H / 2 - 120;
+    ctx.fillStyle = "#4ade80";
+    ctx.font = "bold 26px -apple-system, BlinkMacSystemFont, sans-serif";
+    ctx.fillText("TOP " + LEADERBOARD_SIZE + " GLOBAL SCORE!", W / 2, y);
+    y += 34;
+
+    ctx.fillStyle = "#f472b6";
+    ctx.font = "bold 20px -apple-system, BlinkMacSystemFont, monospace";
+    ctx.fillText("SCORE " + pad(score, 6), W / 2, y);
+    y += 56;
+
+    const boxW = 60, boxGap = 16, totalW = boxW * 3 + boxGap * 2;
+    const startX = W / 2 - totalW / 2;
+    const boxY = y - 30, boxH = 64;
+    for (let i = 0; i < 3; i++) {
+      const bx = startX + i * (boxW + boxGap);
+      const active = i === initialsSlot;
+      ctx.fillStyle = active ? "rgba(74,222,128,0.18)" : "rgba(255,255,255,0.06)";
+      ctx.fillRect(bx, boxY, boxW, boxH);
+      ctx.lineWidth = active ? 3 : 1.5;
+      ctx.strokeStyle = active ? "#4ade80" : "rgba(255,255,255,0.35)";
+      ctx.strokeRect(bx, boxY, boxW, boxH);
+
+      ctx.fillStyle = active ? "#4ade80" : "#f1f5f9";
+      ctx.font = "bold 34px -apple-system, BlinkMacSystemFont, monospace";
+      ctx.fillText(initialsChars[i], bx + boxW / 2, boxY + boxH / 2 + 2);
+
+      if (active) {
+        ctx.font = "bold 16px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillStyle = "#4ade80";
+        ctx.fillText("▲", bx + boxW / 2, boxY - 14);
+        ctx.fillText("▼", bx + boxW / 2, boxY + boxH + 14);
+      }
+    }
+    y = boxY + boxH + 46;
+
+    ctx.fillStyle = "#8ea0bd";
+    ctx.font = "13px -apple-system, BlinkMacSystemFont, sans-serif";
+    ctx.fillText("W/S or drag up/down: change letter · A/D or drag left/right: move", W / 2, y);
+    y += 20;
+    ctx.fillText("SPACE or tap: confirm letter, then confirm again to save", W / 2, y);
+  }
+
+  // Settled game-over screen: stats plus the live global top-10 board.
+  function drawGameOver() {
+    ctx.fillStyle = "rgba(11,18,32,0.82)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    let y = drawGameOverStatsBlock();
+
+    ctx.font = "bold 13px -apple-system, BlinkMacSystemFont, sans-serif";
+    ctx.fillStyle = "#8ea0bd";
+    ctx.fillText("GLOBAL TOP " + LEADERBOARD_SIZE + (highScoresError ? "  (offline - showing last known)" : ""), W / 2, y);
+    y += 18;
+
+    ctx.font = "bold 14px -apple-system, BlinkMacSystemFont, monospace";
+    for (let i = 0; i < LEADERBOARD_SIZE; i++) {
+      const entry = highScores[i];
+      const rank = String(i + 1).padStart(2, " ");
+      if (entry) {
+        ctx.fillStyle = entry === lastQualifyingEntry ? "#4ade80" : "#f1f5f9";
+        ctx.fillText(rank + ". " + entry.initials.padEnd(3, " ") + "   " + pad(entry.score, 6), W / 2, y);
+      } else {
+        ctx.fillStyle = "#3f4b61";
+        ctx.fillText(rank + ". ---   " + pad(0, 6), W / 2, y);
+      }
+      y += 16;
+    }
+    y += 16;
 
     ctx.fillStyle = "#f1f5f9";
     ctx.font = "14px -apple-system, BlinkMacSystemFont, sans-serif";
-    ctx.fillText("Press SPACE or tap the control below when ready", W / 2, H / 2 + 52);
+    ctx.fillText("Press SPACE or tap the control below when ready", W / 2, y);
   }
 
   function render(now) {
@@ -949,7 +1237,10 @@
     if (!gameOver) pellets.forEach(drawPellet);
     balls.forEach((b) => drawBall(b, now));
     if (gameOver) {
-      drawGameOver();
+      if (gameOverPhase === "checking") drawGameOverBusy("Checking the global leaderboard…");
+      else if (gameOverPhase === "enterInitials") drawInitialsEntry();
+      else if (gameOverPhase === "submitting") drawGameOverBusy("Saving your score to the leaderboard…");
+      else drawGameOver();
     } else {
       drawHud();
       drawPopups(now);
@@ -1008,7 +1299,24 @@
         if (timeSurvived > bestTime) { bestTime = timeSurvived; newBestTime = true; }
         if (score > bestScore) { bestScore = score; newBestScore = true; }
         if (newBestDistance || newBestTime || newBestScore) saveBest(bestDistance, bestTime, bestScore);
+
+        // check the live global list before deciding whether to offer
+        // initials entry - see gameOverPhase above for the state machine
+        gameOverPhase = "checking";
+        lastQualifyingEntry = null;
         updateJoyUiForState();
+        const dyingScore = score;
+        fetchHighScores().then(() => {
+          if (!gameOver) return; // shouldn't happen (respawn is blocked outside "final"), but guard anyway
+          if (qualifiesForHighScore(dyingScore)) {
+            gameOverPhase = "enterInitials";
+            initialsChars = ["A", "A", "A"];
+            initialsSlot = 0;
+          } else {
+            gameOverPhase = "final";
+          }
+          updateJoyUiForState();
+        });
       }
     }
 
@@ -1016,6 +1324,7 @@
     requestAnimationFrame(tick);
   }
 
+  fetchHighScores(); // warm the cache on load, so the first "checking" screen is more likely already fresh
   render(performance.now());
   requestAnimationFrame(tick);
 })();
