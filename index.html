@@ -141,7 +141,7 @@
 <body>
 <header>
   <h1>ZIPPY</h1>
-  <p class="tagline">Build 14 &middot; bonus multiplier pellet</p>
+  <p class="tagline">Build 14 &middot; bonus multiplier coin</p>
   <p class="hint">WASD (or drag the joystick below on touch) to fly Zippy around the arena</p>
 </header>
 <div class="stage-wrap">
@@ -191,15 +191,17 @@
   const PELLET_BONUS = 500;  // flat points added to score per pellet collected
   const POPUP_LIFE = 700;    // ms a "+500" pickup popup stays on screen
 
-  // ---------- bonus multiplier pellet ----------
-  // Every PELLET_EAT_STREAK regular pellets Zippy eats, one larger red
-  // pellet spawns at a random spot, drifting slowly off in a random
-  // direction (it bounces off obstacles/walls exactly like the enemy
-  // balls - see resolveObstacleCollisions/resolveWallCollisions below).
+  // ---------- bonus multiplier coin ----------
+  // Every PELLET_EAT_STREAK regular pellets Zippy eats, one larger
+  // spinning gold coin spawns at a random spot, drifting slowly off in a
+  // random direction (it bounces off obstacles/walls exactly like the
+  // enemy balls - see resolveObstacleCollisions/resolveWallCollisions
+  // below). It's drawn gold and glowing rather than red specifically so
+  // it doesn't read as a hazard ball to dodge - see drawBonusPellet().
   // Eating it doesn't add flat points itself; it activates a score
   // multiplier for a few seconds, boosting everything scored while it's
   // active (both pellet bonuses and the ongoing distance x time growth).
-  const PELLET_EAT_STREAK = 10;         // regular pellets eaten per bonus-pellet spawn
+  const PELLET_EAT_STREAK = 10;         // regular pellets eaten per coin spawn
   const BONUS_PELLET_RADIUS = PELLET_RADIUS * 2.2;
   const BONUS_PELLET_SPEED = 70;        // px/sec - much slower than any ball, an easy target
   const BONUS_MULTIPLIER = 2.5;         // "over 2x" while active
@@ -1049,20 +1051,51 @@
     ctx.shadowBlur = 0;
   }
 
-  // Bigger, red, and softly pulsing so it reads at a glance as the rare
-  // bonus pickup rather than just another dot in the pellet field.
+  // A spinning gold coin rather than a plain circle, so it reads at a
+  // glance as an inviting pickup rather than another hazard ball to
+  // dodge - warm gold/amber tones throughout, never red or orange (those
+  // are the enemy balls' palette). The spin is simulated by squashing
+  // the coin's horizontal radius with a cosine wave: it narrows down to
+  // a thin edge-on sliver and back out to full width, exactly like a
+  // tossed coin turning face-to-edge-to-face. A soft pulsing glow and a
+  // sweeping highlight (brightest face-on, gone edge-on) sell the shine.
   function drawBonusPellet(p, now) {
-    const pulse = 0.5 + 0.5 * Math.sin(now / 180);
+    const spin = Math.cos(now / 260); // -1..1, one full "flip" every ~1.6s
+    const rx = Math.max(2, p.r * Math.abs(spin));
+    const ry = p.r;
+
+    const pulse = 0.5 + 0.5 * Math.sin(now / 300);
+    const glowR = p.r * (2.1 + 0.4 * pulse);
+    const glow = ctx.createRadialGradient(p.x, p.y, p.r * 0.3, p.x, p.y, glowR);
+    glow.addColorStop(0, "rgba(251,191,36,0.5)");
+    glow.addColorStop(1, "rgba(251,191,36,0)");
     ctx.beginPath();
-    ctx.arc(p.x, p.y, p.r * (0.92 + 0.12 * pulse), 0, Math.PI * 2);
-    ctx.fillStyle = "#f87171";
-    ctx.shadowColor = "#f87171";
-    ctx.shadowBlur = 16;
+    ctx.arc(p.x, p.y, glowR, 0, Math.PI * 2);
+    ctx.fillStyle = glow;
     ctx.fill();
-    ctx.shadowBlur = 0;
+
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.beginPath();
+    ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
+    const coinGrad = ctx.createLinearGradient(-rx, -ry, rx, ry);
+    coinGrad.addColorStop(0, "#fde68a");
+    coinGrad.addColorStop(0.5, "#fbbf24");
+    coinGrad.addColorStop(1, "#b45309");
+    ctx.fillStyle = coinGrad;
+    ctx.fill();
     ctx.lineWidth = 1.5;
-    ctx.strokeStyle = "rgba(255,255,255,0.6)";
+    ctx.strokeStyle = "#78350f";
     ctx.stroke();
+
+    // bright shine streak, fades out as the coin turns edge-on
+    if (rx > p.r * 0.25) {
+      ctx.beginPath();
+      ctx.ellipse(-rx * 0.25, -ry * 0.3, rx * 0.35, ry * 0.18, -0.4, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(255,255,255,${(0.55 * Math.abs(spin)).toFixed(2)})`;
+      ctx.fill();
+    }
+    ctx.restore();
   }
 
   function drawPopups(now) {
@@ -1169,7 +1202,7 @@
     // countdown so the boost stays visible without growing the HUD box.
     if (scoreMultiplier > 1 && now < multiplierUntil) {
       const remaining = (multiplierUntil - now) / 1000;
-      ctx.fillStyle = "#f87171";
+      ctx.fillStyle = "#fbbf24";
       ctx.font = "bold 10px -apple-system, BlinkMacSystemFont, sans-serif";
       ctx.fillText("×" + BONUS_MULTIPLIER + " SCORE " + remaining.toFixed(1) + "s", W / 2, by + 40);
     } else {
@@ -1395,7 +1428,7 @@
         if (Math.hypot(special.x - bonusPellet.x, special.y - bonusPellet.y) < special.r + bonusPellet.r) {
           scoreMultiplier = BONUS_MULTIPLIER;
           multiplierUntil = now + BONUS_MULTIPLIER_MS;
-          popups.push({ x: bonusPellet.x, y: bonusPellet.y, text: "×" + BONUS_MULTIPLIER + " SCORE!", born: now, color: [248, 113, 113], big: true });
+          popups.push({ x: bonusPellet.x, y: bonusPellet.y, text: "×" + BONUS_MULTIPLIER + " SCORE!", born: now, color: [251, 191, 36], big: true });
           bonusPellet = null;
         }
       }
