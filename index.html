@@ -141,7 +141,7 @@
 <body>
 <header>
   <h1>ZIPPY</h1>
-  <p class="tagline">Build 14 &middot; bonus multiplier coin</p>
+  <p class="tagline">Build 15 &middot; pellets respawn</p>
   <p class="hint">WASD (or drag the joystick below on touch) to fly Zippy around the arena</p>
 </header>
 <div class="stage-wrap">
@@ -189,6 +189,7 @@
   const PELLET_RADIUS = 5;
   const PELLET_COUNT = 10;   // pellets sown per wave pass (5 wave passes per life - see PELLET_WAVE_COUNT below)
   const PELLET_BONUS = 500;  // flat points added to score per pellet collected
+  const PELLET_RESPAWN_MS = 15000; // ms an eaten regular pellet stays gone before reappearing at a fresh random spot
   const POPUP_LIFE = 700;    // ms a "+500" pickup popup stays on screen
 
   // ---------- bonus multiplier coin ----------
@@ -529,17 +530,23 @@
     return out;
   }
 
-  // Picks a random spot for the bonus pellet, reusing the same
-  // obstacle/HUD clearance check the regular pellets use so it never
-  // spawns embedded in a rock or under the HUD.
-  function randomBonusPelletSpot() {
+  // Picks a random spot clear of every obstacle and the HUD, for anything
+  // that needs a fresh random position rather than a wave-placed one - the
+  // bonus coin's spawn point and a regular pellet's respawn point both
+  // reuse this (see randomBonusPelletSpot() and the pellet respawn logic
+  // in tick() below).
+  function randomOpenSpot(radius) {
     let x, y, attempts = 0;
     do {
       x = randRange(30, W - 30);
       y = randRange(85, H - 20);
       attempts++;
-    } while ((tooCloseToObstacle(x, y, BONUS_PELLET_RADIUS + 6) || inHudZone(x, y)) && attempts < 20);
+    } while ((tooCloseToObstacle(x, y, radius + 6) || inHudZone(x, y)) && attempts < 20);
     return { x, y };
+  }
+
+  function randomBonusPelletSpot() {
+    return randomOpenSpot(BONUS_PELLET_RADIUS);
   }
 
   function spawnBonusPellet() {
@@ -1351,7 +1358,7 @@
     ctx.fillRect(0, 0, W, H);
     obstacles.forEach(drawObstacle);
     if (!gameOver) {
-      pellets.forEach(drawPellet);
+      pellets.forEach((p) => { if (!p.collected) drawPellet(p); });
       if (bonusPellet) drawBonusPellet(bonusPellet, now);
     }
     balls.forEach((b) => drawBall(b, now));
@@ -1399,12 +1406,25 @@
       // Pacman-style pellet pickups: a flat, significant bonus straight
       // into score (boosted while the multiplier is active). Every
       // PELLET_EAT_STREAK eaten, spawn the bonus pellet if none is
-      // currently out there.
+      // currently out there. An eaten pellet isn't gone for the rest of
+      // the life - it reappears PELLET_RESPAWN_MS later at a fresh random
+      // spot (never inside an obstacle/HUD, via randomOpenSpot), so a long
+      // run doesn't thin the field out to nothing. Pellets stay in the
+      // array the whole life; `collected` just gates drawing/eating/timing.
       if (pellets.length && special) {
         for (const p of pellets) {
-          if (p.collected) continue;
+          if (p.collected) {
+            if (now >= p.respawnAt) {
+              const spot = randomOpenSpot(PELLET_RADIUS);
+              p.x = spot.x;
+              p.y = spot.y;
+              p.collected = false;
+            }
+            continue;
+          }
           if (Math.hypot(special.x - p.x, special.y - p.y) < special.r + p.r) {
             p.collected = true;
+            p.respawnAt = now + PELLET_RESPAWN_MS;
             const gained = PELLET_BONUS * scoreMultiplier;
             pelletScore += gained;
             pelletsEatenThisLife++;
@@ -1414,7 +1434,6 @@
             }
           }
         }
-        pellets = pellets.filter(p => !p.collected);
       }
 
       // Bonus pellet: drifts and bounces exactly like a ball (reusing the
