@@ -141,7 +141,7 @@
 <body>
 <header>
   <h1>ZIPPY</h1>
-  <p class="tagline">Build 12 &middot; global top 10 leaderboard with initials entry</p>
+  <p class="tagline">Build 14 &middot; bonus multiplier pellet</p>
   <p class="hint">WASD (or drag the joystick below on touch) to fly Zippy around the arena</p>
 </header>
 <div class="stage-wrap">
@@ -190,6 +190,20 @@
   const PELLET_COUNT = 10;   // pellets sown per wave pass (5 wave passes per life - see PELLET_WAVE_COUNT below)
   const PELLET_BONUS = 500;  // flat points added to score per pellet collected
   const POPUP_LIFE = 700;    // ms a "+500" pickup popup stays on screen
+
+  // ---------- bonus multiplier pellet ----------
+  // Every PELLET_EAT_STREAK regular pellets Zippy eats, one larger red
+  // pellet spawns at a random spot, drifting slowly off in a random
+  // direction (it bounces off obstacles/walls exactly like the enemy
+  // balls - see resolveObstacleCollisions/resolveWallCollisions below).
+  // Eating it doesn't add flat points itself; it activates a score
+  // multiplier for a few seconds, boosting everything scored while it's
+  // active (both pellet bonuses and the ongoing distance x time growth).
+  const PELLET_EAT_STREAK = 10;         // regular pellets eaten per bonus-pellet spawn
+  const BONUS_PELLET_RADIUS = PELLET_RADIUS * 2.2;
+  const BONUS_PELLET_SPEED = 70;        // px/sec - much slower than any ball, an easy target
+  const BONUS_MULTIPLIER = 2.5;         // "over 2x" while active
+  const BONUS_MULTIPLIER_MS = 5000;
 
   // ---------- global leaderboard ----------
   // A free, no-login shared JSON bin (json.extendsclass.com) holds the top
@@ -513,8 +527,35 @@
     return out;
   }
 
+  // Picks a random spot for the bonus pellet, reusing the same
+  // obstacle/HUD clearance check the regular pellets use so it never
+  // spawns embedded in a rock or under the HUD.
+  function randomBonusPelletSpot() {
+    let x, y, attempts = 0;
+    do {
+      x = randRange(30, W - 30);
+      y = randRange(85, H - 20);
+      attempts++;
+    } while ((tooCloseToObstacle(x, y, BONUS_PELLET_RADIUS + 6) || inHudZone(x, y)) && attempts < 20);
+    return { x, y };
+  }
+
+  function spawnBonusPellet() {
+    const { x, y } = randomBonusPelletSpot();
+    const angle = Math.random() * Math.PI * 2;
+    return {
+      x, y,
+      vx: Math.cos(angle) * BONUS_PELLET_SPEED,
+      vy: Math.sin(angle) * BONUS_PELLET_SPEED,
+      r: BONUS_PELLET_RADIUS,
+      collected: false
+    };
+  }
+
   let pellets = generatePellets();
-  let popups = []; // transient "+500" pickup feedback text
+  let bonusPellet = null;         // at most one on the field at a time
+  let pelletsEatenThisLife = 0;   // counts toward the next bonus-pellet spawn
+  let popups = []; // transient pickup feedback text ("+500", "x2.5 SCORE!", ...)
 
   // ---------- balls ----------
   // Zippy (special) spawns away from the other four, in a clear corner,
@@ -576,6 +617,16 @@
   let timeSurvived = 0;
   let pelletScore = 0;
   let score = 0;
+  // score = survivalScore + pelletScore. survivalScore accumulates the
+  // distance x time growth frame by frame (rather than recomputing the
+  // product fresh each frame) specifically so the active-multiplier
+  // window below can scale each frame's increment - see the scoring
+  // block in tick(). With no multiplier ever applied it telescopes back
+  // to exactly distance * timeSurvived, so normal play is unaffected.
+  let survivalScore = 0;
+  let prevDistanceTimeProduct = 0;
+  let scoreMultiplier = 1;   // >1 while a bonus pellet's boost is active
+  let multiplierUntil = 0;   // performance.now() timestamp the boost ends
 
   let balls = initBalls();
   let gameOver = false;
@@ -817,6 +868,8 @@
     balls = initBalls();
     obstacles = generateObstacles();
     pellets = generatePellets();
+    bonusPellet = null;
+    pelletsEatenThisLife = 0;
     popups = [];
     // release any held joystick drag so a finger resting on the stick
     // from the previous life doesn't hand Zippy instant full thrust
@@ -830,6 +883,10 @@
     timeSurvived = 0;
     pelletScore = 0;
     score = 0;
+    survivalScore = 0;
+    prevDistanceTimeProduct = 0;
+    scoreMultiplier = 1;
+    multiplierUntil = 0;
     newBestDistance = false;
     newBestTime = false;
     newBestScore = false;
@@ -992,14 +1049,31 @@
     ctx.shadowBlur = 0;
   }
 
+  // Bigger, red, and softly pulsing so it reads at a glance as the rare
+  // bonus pickup rather than just another dot in the pellet field.
+  function drawBonusPellet(p, now) {
+    const pulse = 0.5 + 0.5 * Math.sin(now / 180);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r * (0.92 + 0.12 * pulse), 0, Math.PI * 2);
+    ctx.fillStyle = "#f87171";
+    ctx.shadowColor = "#f87171";
+    ctx.shadowBlur = 16;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = "rgba(255,255,255,0.6)";
+    ctx.stroke();
+  }
+
   function drawPopups(now) {
     if (!popups.length) return;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.font = "bold 14px -apple-system, BlinkMacSystemFont, monospace";
     for (const p of popups) {
       const t = Math.min(1, (now - p.born) / POPUP_LIFE);
-      ctx.fillStyle = `rgba(253,230,138,${(1 - t).toFixed(3)})`;
+      ctx.font = (p.big ? "bold 20px " : "bold 14px ") + "-apple-system, BlinkMacSystemFont, monospace";
+      const [r, g, b] = p.color || [253, 230, 138];
+      ctx.fillStyle = `rgba(${r},${g},${b},${(1 - t).toFixed(3)})`;
       ctx.fillText(p.text, p.x, p.y - t * 26);
     }
   }
@@ -1054,7 +1128,7 @@
     }
   }
 
-  function drawHud() {
+  function drawHud(now) {
     ctx.fillStyle = "rgba(11,18,32,0.55)";
     ctx.fillRect(10, 10, 150, 44);
     ctx.fillRect(W - 160, 10, 150, 44);
@@ -1091,9 +1165,18 @@
     ctx.font = "bold 20px -apple-system, BlinkMacSystemFont, monospace";
     ctx.fillText(pad(score, 6), W / 2, by + 20);
 
-    ctx.fillStyle = "#8ea0bd";
-    ctx.font = "10px -apple-system, BlinkMacSystemFont, sans-serif";
-    ctx.fillText("best " + pad(bestScore, 6), W / 2, by + 40);
+    // While the bonus multiplier is active, swap the "best" line for a
+    // countdown so the boost stays visible without growing the HUD box.
+    if (scoreMultiplier > 1 && now < multiplierUntil) {
+      const remaining = (multiplierUntil - now) / 1000;
+      ctx.fillStyle = "#f87171";
+      ctx.font = "bold 10px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillText("×" + BONUS_MULTIPLIER + " SCORE " + remaining.toFixed(1) + "s", W / 2, by + 40);
+    } else {
+      ctx.fillStyle = "#8ea0bd";
+      ctx.font = "10px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillText("best " + pad(bestScore, 6), W / 2, by + 40);
+    }
   }
 
   // Shared "GAME OVER" title + DISTANCE/TIME/SCORE lines, used by every
@@ -1234,7 +1317,10 @@
     ctx.fillStyle = "#0f172a";
     ctx.fillRect(0, 0, W, H);
     obstacles.forEach(drawObstacle);
-    if (!gameOver) pellets.forEach(drawPellet);
+    if (!gameOver) {
+      pellets.forEach(drawPellet);
+      if (bonusPellet) drawBonusPellet(bonusPellet, now);
+    }
     balls.forEach((b) => drawBall(b, now));
     if (gameOver) {
       if (gameOverPhase === "checking") drawGameOverBusy("Checking the global leaderboard…");
@@ -1242,7 +1328,7 @@
       else if (gameOverPhase === "submitting") drawGameOverBusy("Saving your score to the leaderboard…");
       else drawGameOver();
     } else {
-      drawHud();
+      drawHud(now);
       drawPopups(now);
     }
   }
@@ -1259,6 +1345,7 @@
       // see tryRespawn(), triggered by spacebar or a joystick-zone tap
     } else {
       timeSurvived += dt;
+      if (scoreMultiplier > 1 && now >= multiplierUntil) scoreMultiplier = 1;
       for (const ball of balls) {
         if (ball.special) {
           applyPlayerControl(ball, dt);
@@ -1274,24 +1361,55 @@
         }
       }
 
-      // Pacman-style pellet pickups: a flat, significant bonus straight into score
-      if (pellets.length) {
-        const special = balls.find(b => b.special);
-        if (special) {
-          for (const p of pellets) {
-            if (p.collected) continue;
-            if (Math.hypot(special.x - p.x, special.y - p.y) < special.r + p.r) {
-              p.collected = true;
-              pelletScore += PELLET_BONUS;
-              popups.push({ x: p.x, y: p.y, text: "+" + PELLET_BONUS, born: now });
+      const special = balls.find(b => b.special);
+
+      // Pacman-style pellet pickups: a flat, significant bonus straight
+      // into score (boosted while the multiplier is active). Every
+      // PELLET_EAT_STREAK eaten, spawn the bonus pellet if none is
+      // currently out there.
+      if (pellets.length && special) {
+        for (const p of pellets) {
+          if (p.collected) continue;
+          if (Math.hypot(special.x - p.x, special.y - p.y) < special.r + p.r) {
+            p.collected = true;
+            const gained = PELLET_BONUS * scoreMultiplier;
+            pelletScore += gained;
+            pelletsEatenThisLife++;
+            popups.push({ x: p.x, y: p.y, text: "+" + Math.round(gained), born: now });
+            if (!bonusPellet && pelletsEatenThisLife % PELLET_EAT_STREAK === 0) {
+              bonusPellet = spawnBonusPellet();
             }
           }
-          pellets = pellets.filter(p => !p.collected);
+        }
+        pellets = pellets.filter(p => !p.collected);
+      }
+
+      // Bonus pellet: drifts and bounces exactly like a ball (reusing the
+      // same obstacle/wall collision helpers), and eating it starts the
+      // score multiplier rather than adding flat points itself.
+      if (bonusPellet && special) {
+        bonusPellet.x += bonusPellet.vx * dt;
+        bonusPellet.y += bonusPellet.vy * dt;
+        resolveObstacleCollisions(bonusPellet);
+        resolveWallCollisions(bonusPellet);
+        if (Math.hypot(special.x - bonusPellet.x, special.y - bonusPellet.y) < special.r + bonusPellet.r) {
+          scoreMultiplier = BONUS_MULTIPLIER;
+          multiplierUntil = now + BONUS_MULTIPLIER_MS;
+          popups.push({ x: bonusPellet.x, y: bonusPellet.y, text: "×" + BONUS_MULTIPLIER + " SCORE!", born: now, color: [248, 113, 113], big: true });
+          bonusPellet = null;
         }
       }
+
       popups = popups.filter(p => now - p.born < POPUP_LIFE);
 
-      score = distance * timeSurvived + pelletScore;
+      // survivalScore accumulates this frame's share of distance x time
+      // growth, scaled by whatever multiplier is active right now - see
+      // the declaration above for why this telescopes back to the plain
+      // distance * timeSurvived formula when the multiplier is never used.
+      const distanceTimeProduct = distance * timeSurvived;
+      survivalScore += (distanceTimeProduct - prevDistanceTimeProduct) * scoreMultiplier;
+      prevDistanceTimeProduct = distanceTimeProduct;
+      score = survivalScore + pelletScore;
       if (now >= graceUntil && checkSpecialCollision()) {
         gameOver = true;
         gameOverAt = now;
