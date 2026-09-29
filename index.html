@@ -141,7 +141,7 @@
 <body>
 <header>
   <h1>ZIPPY</h1>
-  <p class="tagline">Build 16 &middot; storm hazard</p>
+  <p class="tagline">Build 17 &middot; storm slows enemies</p>
   <p class="hint">WASD (or drag the joystick below on touch) to fly Zippy around the arena</p>
 </header>
 <div class="stage-wrap">
@@ -222,9 +222,14 @@
   // already off-screen) - see resolveStormWallCollisions(). While Zippy's
   // center is inside it, score drains continuously rather than in a lump,
   // consistent with how the rest of scoring accumulates frame by frame.
+  // It also bogs down the enemy balls (not just Zippy) while they're
+  // inside it, so it isn't purely a hazard for the player to dodge - it
+  // reshuffles the whole arena's danger, occasionally turning a "safe"
+  // camping spot into one where a slowed rival is easier to outmaneuver.
   const STORM_RADIUS = Math.sqrt((W * H) / (6 * Math.PI)); // area ~= 1/6 of the 900x600 arena
   const STORM_SPEED = 18;               // px/sec - much slower than even the bonus coin
   const STORM_DRAIN_PER_SEC = 500;      // points lost per second Zippy spends inside it
+  const STORM_ENEMY_SLOW = 0.5;         // enemy balls move at this fraction of their normal speed while inside
 
   // ---------- global leaderboard ----------
   // A free, no-login shared JSON bin (json.extendsclass.com) holds the top
@@ -1499,6 +1504,16 @@
     } else {
       timeSurvived += dt;
       if (scoreMultiplier > 1 && now >= multiplierUntil) scoreMultiplier = 1;
+
+      // Storm hazard moves first each frame, ahead of the balls loop
+      // below, so both the enemy-slowdown check and the player-in-storm
+      // check later see this frame's storm position rather than lagging
+      // a frame behind it. It bounces off the arena walls only (not
+      // obstacles - see resolveStormWallCollisions).
+      storm.x += storm.vx * dt;
+      storm.y += storm.vy * dt;
+      resolveStormWallCollisions(storm);
+
       for (const ball of balls) {
         if (ball.special) {
           applyPlayerControl(ball, dt);
@@ -1510,7 +1525,11 @@
         if (ball.special) {
           distance += Math.hypot(ball.vx, ball.vy) * dt;
         } else {
-          clampSpeed(ball, enemySpeedNow());
+          // enemy balls bog down to STORM_ENEMY_SLOW of their normal
+          // speed while inside the storm - it slows rivals down too,
+          // not just Zippy
+          const inStormNow = Math.hypot(ball.x - storm.x, ball.y - storm.y) < storm.r + ball.r;
+          clampSpeed(ball, enemySpeedNow() * (inStormNow ? STORM_ENEMY_SLOW : 1));
         }
       }
 
@@ -1565,13 +1584,9 @@
         }
       }
 
-      // Storm hazard: drifts very slowly and bounces off the arena walls
-      // only (not obstacles - see resolveStormWallCollisions). Deters
-      // camping in a tight wall/obstacle gap, since that spot is only
-      // safe from the enemy balls, not from the storm drifting through it.
-      storm.x += storm.vx * dt;
-      storm.y += storm.vy * dt;
-      resolveStormWallCollisions(storm);
+      // Storm hazard already moved earlier this frame (before the balls
+      // loop, so the enemy-slowdown check above saw this frame's storm
+      // position) - this is just the player-in-storm check for scoring.
       inStorm = now >= graceUntil && !!special &&
         Math.hypot(special.x - storm.x, special.y - storm.y) < storm.r + special.r;
 
