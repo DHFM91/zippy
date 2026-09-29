@@ -141,7 +141,7 @@
 <body>
 <header>
   <h1>ZIPPY</h1>
-  <p class="tagline">Build 15 &middot; pellets respawn</p>
+  <p class="tagline">Build 16 &middot; storm hazard</p>
   <p class="hint">WASD (or drag the joystick below on touch) to fly Zippy around the arena</p>
 </header>
 <div class="stage-wrap">
@@ -207,6 +207,24 @@
   const BONUS_PELLET_SPEED = 70;        // px/sec - much slower than any ball, an easy target
   const BONUS_MULTIPLIER = 2.5;         // "over 2x" while active
   const BONUS_MULTIPLIER_MS = 5000;
+
+  // ---------- storm hazard ----------
+  // A slow-drifting red "storm" circle discourages camping in a tight
+  // corner/wall gap - a spot that's safe from the enemy balls is not
+  // necessarily safe from this. Sized so its area is roughly a sixth of
+  // the arena (a circle that size reads as a real zone to avoid, not a
+  // token effect); it bounces off the arena walls only (not obstacles -
+  // it's weather passing over the terrain, not a solid object), and is
+  // allowed to drift up to half its own width off-screen before bouncing
+  // back, which is exactly what happens if the bounce is keyed off the
+  // storm's *center* crossing the wall (a circle is symmetric, so when
+  // its center sits exactly on the boundary, exactly half its area is
+  // already off-screen) - see resolveStormWallCollisions(). While Zippy's
+  // center is inside it, score drains continuously rather than in a lump,
+  // consistent with how the rest of scoring accumulates frame by frame.
+  const STORM_RADIUS = Math.sqrt((W * H) / (6 * Math.PI)); // area ~= 1/6 of the 900x600 arena
+  const STORM_SPEED = 18;               // px/sec - much slower than even the bonus coin
+  const STORM_DRAIN_PER_SEC = 500;      // points lost per second Zippy spends inside it
 
   // ---------- global leaderboard ----------
   // A free, no-login shared JSON bin (json.extendsclass.com) holds the top
@@ -561,9 +579,28 @@
     };
   }
 
+  // Starts away from the balls' spawn cluster (roughly (450,300)) so it
+  // isn't sitting on top of Zippy the instant a life begins.
+  function spawnStorm() {
+    let x, y;
+    do {
+      x = randRange(0, W);
+      y = randRange(0, H);
+    } while (Math.hypot(x - 450, y - 300) < 250);
+    const angle = Math.random() * Math.PI * 2;
+    return {
+      x, y,
+      vx: Math.cos(angle) * STORM_SPEED,
+      vy: Math.sin(angle) * STORM_SPEED,
+      r: STORM_RADIUS
+    };
+  }
+
   let pellets = generatePellets();
   let bonusPellet = null;         // at most one on the field at a time
   let pelletsEatenThisLife = 0;   // counts toward the next bonus-pellet spawn
+  let storm = spawnStorm();
+  let inStorm = false;            // true while Zippy is inside the storm right now (read by the HUD)
   let popups = []; // transient pickup feedback text ("+500", "x2.5 SCORE!", ...)
 
   // ---------- balls ----------
@@ -626,12 +663,15 @@
   let timeSurvived = 0;
   let pelletScore = 0;
   let score = 0;
-  // score = survivalScore + pelletScore. survivalScore accumulates the
-  // distance x time growth frame by frame (rather than recomputing the
+  // score = max(0, survivalScore + pelletScore). survivalScore accumulates
+  // the distance x time growth frame by frame (rather than recomputing the
   // product fresh each frame) specifically so the active-multiplier
-  // window below can scale each frame's increment - see the scoring
-  // block in tick(). With no multiplier ever applied it telescopes back
-  // to exactly distance * timeSurvived, so normal play is unaffected.
+  // window below can scale each frame's increment, and so the storm
+  // hazard's continuous drain can subtract from the same running total -
+  // see the scoring block in tick(). With no multiplier and no storm time
+  // it telescopes back to exactly distance * timeSurvived, so normal play
+  // is unaffected; the final max(0, ...) just keeps a storm-heavy run from
+  // showing a negative score.
   let survivalScore = 0;
   let prevDistanceTimeProduct = 0;
   let scoreMultiplier = 1;   // >1 while a bonus pellet's boost is active
@@ -758,6 +798,17 @@
     if (ball.y + ball.r > H) { ball.y = H - ball.r; ball.vy = -Math.abs(ball.vy); }
   }
 
+  // Same idea as resolveWallCollisions, but keyed off the storm's *center*
+  // reaching the wall instead of its edge - that's what lets it drift up
+  // to 50% off-screen before bouncing back (see the storm hazard comment
+  // above the STORM_RADIUS/STORM_SPEED constants).
+  function resolveStormWallCollisions(storm) {
+    if (storm.x < 0) { storm.x = 0; storm.vx = Math.abs(storm.vx); }
+    if (storm.x > W) { storm.x = W; storm.vx = -Math.abs(storm.vx); }
+    if (storm.y < 0) { storm.y = 0; storm.vy = Math.abs(storm.vy); }
+    if (storm.y > H) { storm.y = H; storm.vy = -Math.abs(storm.vy); }
+  }
+
   // keep speed exactly constant for the non-player balls, even after
   // floating point drift from repeated bounces
   function clampSpeed(ball, speed) {
@@ -879,6 +930,8 @@
     pellets = generatePellets();
     bonusPellet = null;
     pelletsEatenThisLife = 0;
+    storm = spawnStorm();
+    inStorm = false;
     popups = [];
     // release any held joystick drag so a finger resting on the stick
     // from the previous life doesn't hand Zippy instant full thrust
@@ -1105,6 +1158,49 @@
     ctx.restore();
   }
 
+  // Translucent, churning red storm circle. Layered soft-edged "gust"
+  // blobs slowly orbit inside it (clipped to the storm's own circle) on
+  // top of a base radial fill, for a turbulent look rather than a flat
+  // dot; a thin ring traces its true extent so its edge still reads
+  // clearly even where the fill alone is faint.
+  function drawStorm(storm, now) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(storm.x, storm.y, storm.r, 0, Math.PI * 2);
+    ctx.clip();
+
+    const base = ctx.createRadialGradient(storm.x, storm.y, storm.r * 0.1, storm.x, storm.y, storm.r);
+    base.addColorStop(0, "rgba(239,68,68,0.28)");
+    base.addColorStop(0.7, "rgba(239,68,68,0.16)");
+    base.addColorStop(1, "rgba(239,68,68,0.05)");
+    ctx.beginPath();
+    ctx.arc(storm.x, storm.y, storm.r, 0, Math.PI * 2);
+    ctx.fillStyle = base;
+    ctx.fill();
+
+    const gustCount = 4;
+    for (let i = 0; i < gustCount; i++) {
+      const angle = now / 2600 + (i / gustCount) * Math.PI * 2;
+      const gx = storm.x + Math.cos(angle) * storm.r * 0.5;
+      const gy = storm.y + Math.sin(angle) * storm.r * 0.5;
+      const gr = storm.r * 0.42;
+      const gust = ctx.createRadialGradient(gx, gy, 0, gx, gy, gr);
+      gust.addColorStop(0, "rgba(220,38,38,0.22)");
+      gust.addColorStop(1, "rgba(220,38,38,0)");
+      ctx.beginPath();
+      ctx.arc(gx, gy, gr, 0, Math.PI * 2);
+      ctx.fillStyle = gust;
+      ctx.fill();
+    }
+    ctx.restore();
+
+    ctx.beginPath();
+    ctx.arc(storm.x, storm.y, storm.r, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(239,68,68,0.45)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
   function drawPopups(now) {
     if (!popups.length) return;
     ctx.textAlign = "center";
@@ -1206,8 +1302,14 @@
     ctx.fillText(pad(score, 6), W / 2, by + 20);
 
     // While the bonus multiplier is active, swap the "best" line for a
-    // countdown so the boost stays visible without growing the HUD box.
-    if (scoreMultiplier > 1 && now < multiplierUntil) {
+    // countdown so the boost stays visible without growing the HUD box;
+    // the storm drain warning takes priority over both if it's also true,
+    // since standing in the storm is the more urgent thing to react to.
+    if (inStorm) {
+      ctx.fillStyle = "#f87171";
+      ctx.font = "bold 10px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillText("IN STORM -" + STORM_DRAIN_PER_SEC + "/s", W / 2, by + 40);
+    } else if (scoreMultiplier > 1 && now < multiplierUntil) {
       const remaining = (multiplierUntil - now) / 1000;
       ctx.fillStyle = "#fbbf24";
       ctx.font = "bold 10px -apple-system, BlinkMacSystemFont, sans-serif";
@@ -1362,12 +1464,23 @@
       if (bonusPellet) drawBonusPellet(bonusPellet, now);
     }
     balls.forEach((b) => drawBall(b, now));
+    if (!gameOver) drawStorm(storm, now);
     if (gameOver) {
       if (gameOverPhase === "checking") drawGameOverBusy("Checking the global leaderboard…");
       else if (gameOverPhase === "enterInitials") drawInitialsEntry();
       else if (gameOverPhase === "submitting") drawGameOverBusy("Saving your score to the leaderboard…");
       else drawGameOver();
     } else {
+      // unmistakable feedback that points are draining right now, on top
+      // of the HUD's own "-500/s" line (see drawHud) - a soft red vignette
+      // at the screen edges rather than anything that would obscure play
+      if (inStorm) {
+        const vignette = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) / 3, W / 2, H / 2, Math.min(W, H) / 1.15);
+        vignette.addColorStop(0, "rgba(239,68,68,0)");
+        vignette.addColorStop(1, "rgba(239,68,68,0.22)");
+        ctx.fillStyle = vignette;
+        ctx.fillRect(0, 0, W, H);
+      }
       drawHud(now);
       drawPopups(now);
     }
@@ -1452,16 +1565,28 @@
         }
       }
 
+      // Storm hazard: drifts very slowly and bounces off the arena walls
+      // only (not obstacles - see resolveStormWallCollisions). Deters
+      // camping in a tight wall/obstacle gap, since that spot is only
+      // safe from the enemy balls, not from the storm drifting through it.
+      storm.x += storm.vx * dt;
+      storm.y += storm.vy * dt;
+      resolveStormWallCollisions(storm);
+      inStorm = now >= graceUntil && !!special &&
+        Math.hypot(special.x - storm.x, special.y - storm.y) < storm.r + special.r;
+
       popups = popups.filter(p => now - p.born < POPUP_LIFE);
 
       // survivalScore accumulates this frame's share of distance x time
-      // growth, scaled by whatever multiplier is active right now - see
-      // the declaration above for why this telescopes back to the plain
-      // distance * timeSurvived formula when the multiplier is never used.
+      // growth, scaled by whatever multiplier is active right now, minus
+      // whatever the storm drains this frame if Zippy is currently inside
+      // it - see the declaration above for why this telescopes back to
+      // the plain distance * timeSurvived formula when neither is in play.
       const distanceTimeProduct = distance * timeSurvived;
       survivalScore += (distanceTimeProduct - prevDistanceTimeProduct) * scoreMultiplier;
       prevDistanceTimeProduct = distanceTimeProduct;
-      score = survivalScore + pelletScore;
+      if (inStorm) survivalScore -= STORM_DRAIN_PER_SEC * dt;
+      score = Math.max(0, survivalScore + pelletScore);
       if (now >= graceUntil && checkSpecialCollision()) {
         gameOver = true;
         gameOverAt = now;
