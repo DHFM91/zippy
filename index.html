@@ -1043,11 +1043,15 @@
     }
   }
 
-  function checkSpecialCollision() {
+  function checkSpecialCollision(now) {
     const special = balls.find(b => b.special);
     if (!special) return false;
     for (const other of balls) {
       if (other === special) continue;
+      // stunned enemies are harmless - Zippy passes straight through them
+      // instead of dying on contact, so a stun is a real way past a ball
+      // rather than just a frozen wall
+      if (other.stunnedUntil && now < other.stunnedUntil) continue;
       const dx = other.x - special.x, dy = other.y - special.y;
       const dist = Math.hypot(dx, dy);
       if (dist < other.r + special.r) return true;
@@ -1753,9 +1757,10 @@
           applyPlayerControl(ball, dt);
         } else if (ball.stunnedUntil && now < ball.stunnedUntil) {
           // a stunned ball is frozen in place - no movement, no collision
-          // resolution needed since it isn't going anywhere - but it's
-          // still solid: checkSpecialCollision() below doesn't check stun
-          // state, so bumping into it is still game over
+          // resolution needed since it isn't going anywhere - and it's no
+          // longer solid to Zippy either: checkSpecialCollision() below
+          // skips stunned balls, so running through one is safe (stunning
+          // buys passable room to maneuver, not just a frozen obstacle)
           continue;
         }
         ball.x += ball.vx * dt;
@@ -1892,7 +1897,7 @@
       prevDistanceTimeProduct = distanceTimeProduct;
       if (inStorm) survivalScore -= STORM_DRAIN_PER_SEC * dt;
       score = Math.max(0, survivalScore + pelletScore);
-      if (now >= graceUntil && checkSpecialCollision()) {
+      if (now >= graceUntil && checkSpecialCollision(now)) {
         gameOver = true;
         gameOverAt = now;
         if (distance > bestDistance) { bestDistance = distance; newBestDistance = true; }
