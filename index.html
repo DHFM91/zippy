@@ -65,6 +65,7 @@
     aspect-ratio: 3 / 2;
     border-radius: 10px;
     background: #0f172a;
+    cursor: crosshair;
   }
   footer {
     color: var(--muted);
@@ -75,11 +76,17 @@
   /* A drag joystick instead of hold-buttons: continuous drag gestures
      don't trigger iOS's long-press "select/copy" callout the way a
      sustained hold on a static button can. */
+  .joystick-row {
+    display: flex;
+    justify-content: center;
+    gap: 28px;
+    margin: 16px auto 0;
+  }
   .joystick-wrap {
     display: flex;
     flex-direction: column;
     align-items: center;
-    margin: 16px auto 0;
+    margin: 0;
   }
   .joystick-zone {
     width: 140px;
@@ -120,6 +127,16 @@
     color: var(--muted);
     font-size: 12px;
   }
+  /* aim/shoot stick is visually distinct (red) from the move stick (green)
+     so the two are never confused at a glance */
+  .aim-zone {
+    background: rgba(248,113,113,0.08);
+    border-color: rgba(248,113,113,0.35);
+  }
+  .aim-handle {
+    background: rgba(248,113,113,0.28);
+    border-color: #f87171;
+  }
 
   /* ---------- mobile: shrink chrome so more of the screen is game ---------- */
   @media (max-width: 640px) {
@@ -128,7 +145,7 @@
     p.tagline { font-size: 10px; margin-top: 2px; }
     p.hint { font-size: 10px; margin-top: 2px; }
     .stage-wrap { padding: 8px; border-radius: 12px; }
-    .joystick-wrap { margin-top: 8px; }
+    .joystick-row { margin-top: 8px; gap: 14px; }
     .joystick-zone { width: 112px; height: 112px; }
     .joystick-handle { width: 46px; height: 46px; }
     .joy-label { font-size: 10px; margin-top: 4px; }
@@ -141,16 +158,24 @@
 <body>
 <header>
   <h1>ZIPPY</h1>
-  <p class="tagline">Build 17 &middot; storm slows enemies</p>
-  <p class="hint">WASD (or drag the joystick below on touch) to fly Zippy around the arena</p>
+  <p class="tagline">Build 18 &middot; twin-stick shooting</p>
+  <p class="hint">WASD to move, aim with the mouse and click (or hold) to shoot &middot; on touch, left stick moves, right stick aims &amp; shoots</p>
 </header>
 <div class="stage-wrap">
   <canvas id="stage" width="900" height="600"></canvas>
-  <div class="joystick-wrap">
-    <div class="joystick-zone" id="joystick" aria-label="Drag to steer Zippy">
-      <div class="joystick-handle"></div>
+  <div class="joystick-row">
+    <div class="joystick-wrap">
+      <div class="joystick-zone" id="joystick" aria-label="Drag to steer Zippy">
+        <div class="joystick-handle"></div>
+      </div>
+      <p class="joy-label">Drag to move</p>
     </div>
-    <p class="joy-label">Drag to steer</p>
+    <div class="joystick-wrap">
+      <div class="joystick-zone aim-zone" id="aimJoystick" aria-label="Drag to aim and shoot">
+        <div class="joystick-handle aim-handle"></div>
+      </div>
+      <p class="joy-label">Drag to aim &amp; shoot</p>
+    </div>
   </div>
 </div>
 <footer>Zippy &middot; recreated from a 1999 BASIC original</footer>
@@ -230,6 +255,23 @@
   const STORM_SPEED = 18;               // px/sec - much slower than even the bonus coin
   const STORM_DRAIN_PER_SEC = 500;      // points lost per second Zippy spends inside it
   const STORM_ENEMY_SLOW = 0.5;         // enemy balls move at this fraction of their normal speed while inside
+
+  // ---------- shooting (Robotron-style twin-stick) ----------
+  // Zippy can shoot in any direction independent of his movement direction
+  // - WASD/move-stick steers him, while aiming (mouse, or a second touch
+  // stick) fires bullets. A bullet stuns whichever enemy ball it hits for
+  // STUN_MS (frozen in place - see the stun handling in tick() - but still
+  // solid/lethal on touch, so stunning buys room to maneuver rather than
+  // being a free kill), and chips away at whichever obstacle it hits,
+  // shrinking that shape toward its own center a little more each hit
+  // until it's fully gone - see damageObstacle().
+  const BULLET_SPEED = 620;          // px/sec
+  const BULLET_RADIUS = 4;
+  const BULLET_LIFETIME_MS = 900;    // despawns after this long even if it never hits anything or leaves the arena
+  const FIRE_INTERVAL_MS = 130;      // minimum ms between shots while firing is held (~7.7 shots/sec)
+  const AIM_DEADZONE = 0.35;         // aim stick must be pushed at least this far from center to count as aiming/firing
+  const STUN_MS = 5000;
+  const OBSTACLE_HITS_TO_DESTROY = 6; // bullet hits an obstacle takes before it's fully chipped away
 
   // ---------- global leaderboard ----------
   // A free, no-login shared JSON bin (json.extendsclass.com) holds the top
@@ -385,6 +427,104 @@
     joyZone.addEventListener("contextmenu", (e) => e.preventDefault());
   }
 
+  // ---------- input (touch joystick, aim & shoot) ----------
+  // A second, independent drag stick - same drag-to-vector mechanics as
+  // the move stick above, tracked under its own pointer id so both sticks
+  // can be held by different fingers at once. Its vector doubles as both
+  // the aim direction and the "is firing" signal (see getFireState()
+  // below): push it past AIM_DEADZONE and Zippy shoots that way. It's
+  // inert during any GAME OVER phase - only the move stick does double
+  // duty there (initials entry / tap-to-continue).
+  const aim = { x: 0, y: 0 }; // -1..1 per axis, magnitude <= 1
+  const aimZone = document.getElementById("aimJoystick");
+  const aimHandle = aimZone ? aimZone.querySelector(".joystick-handle") : null;
+  let aimPointerId = null;
+
+  function setAimHandle(dx, dy) {
+    if (aimHandle) aimHandle.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+  }
+
+  function aimMove(e) {
+    if (aimPointerId === null || e.pointerId !== aimPointerId) return;
+    e.preventDefault();
+    const rect = aimZone.getBoundingClientRect();
+    const maxR = rect.width / 2 - 6;
+    let dx = e.clientX - (rect.left + rect.width / 2);
+    let dy = e.clientY - (rect.top + rect.height / 2);
+    const dist = Math.hypot(dx, dy);
+    if (dist > maxR) {
+      dx = (dx / dist) * maxR;
+      dy = (dy / dist) * maxR;
+    }
+    aim.x = dx / maxR;
+    aim.y = dy / maxR;
+    setAimHandle(dx, dy);
+  }
+  function aimEnd(e) {
+    if (aimPointerId === null || e.pointerId !== aimPointerId) return;
+    aimPointerId = null;
+    aim.x = 0;
+    aim.y = 0;
+    setAimHandle(0, 0);
+  }
+  if (aimZone) {
+    aimZone.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      if (gameOver) return; // aim stick has no role in any GAME OVER phase
+      aimPointerId = e.pointerId;
+      aimZone.setPointerCapture(e.pointerId);
+      aimMove(e);
+    });
+    aimZone.addEventListener("pointermove", aimMove);
+    aimZone.addEventListener("pointerup", aimEnd);
+    aimZone.addEventListener("pointercancel", aimEnd);
+    aimZone.addEventListener("contextmenu", (e) => e.preventDefault());
+  }
+
+  // ---------- input (mouse aim & shoot, desktop) ----------
+  // Move the mouse to aim, hold the left button to fire - independent of
+  // WASD movement, exactly like the touch aim stick above. Coordinates are
+  // converted from CSS pixels into the game's fixed 900x600 logical space
+  // (the canvas is displayed much larger than that - see RENDER_SCALE)
+  // using the canvas's own rendered rect, so it stays correct at any
+  // screen size.
+  const mouse = { x: W / 2, y: H / 2, down: false };
+  function updateMouseFromEvent(e) {
+    const rect = canvas.getBoundingClientRect();
+    mouse.x = (e.clientX - rect.left) / rect.width * W;
+    mouse.y = (e.clientY - rect.top) / rect.height * H;
+  }
+  canvas.addEventListener("mousemove", updateMouseFromEvent);
+  canvas.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    updateMouseFromEvent(e);
+    mouse.down = true;
+  });
+  window.addEventListener("mouseup", (e) => {
+    if (e.button === 0) mouse.down = false;
+  });
+  canvas.addEventListener("mouseleave", () => { mouse.down = false; });
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  // Resolves whichever aim input is currently active into one direction +
+  // firing flag. The aim stick takes priority when pushed past its
+  // deadzone (so a touch player holding both sticks always gets stick
+  // aim); otherwise a held left mouse button aims at the live cursor
+  // position. Returns firing:false if neither is active or Zippy isn't
+  // on the field to aim from.
+  function getFireState(special) {
+    const aimMag = Math.hypot(aim.x, aim.y);
+    if (aimMag > AIM_DEADZONE) {
+      return { firing: true, dx: aim.x / aimMag, dy: aim.y / aimMag };
+    }
+    if (mouse.down && special) {
+      const dx = mouse.x - special.x, dy = mouse.y - special.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist > 0.001) return { firing: true, dx: dx / dist, dy: dy / dist };
+    }
+    return { firing: false, dx: 0, dy: 0 };
+  }
+
   // ---------- geometry helpers ----------
   // Irregular, jagged polygon generator used for obstacles. Each vertex
   // gets its own radius jitter (how spiky/uneven the outline is) and a
@@ -418,6 +558,12 @@
     return edges;
   }
 
+  function centroidOf(points) {
+    let sx = 0, sy = 0;
+    for (const [x, y] of points) { sx += x; sy += y; }
+    return [sx / points.length, sy / points.length];
+  }
+
   function randRange(min, max) { return min + Math.random() * (max - min); }
   function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
@@ -444,11 +590,48 @@
       const stretchX = randRange(0.75, 1.3);           // occasional elongated shard look
       const stretchY = randRange(0.75, 1.3);
       const points = jaggedShape(slot.cx, slot.cy, baseR, sides, jaggedness, rotation, stretchX, stretchY);
-      return { points, fill: slot.fill, stroke: slot.stroke, edges: edgesOf(points) };
+      // basePoints/centroid/hits back the bullet-chipping system below
+      // (damageObstacle): points/edges are the *current* (possibly
+      // shrunk) shape actually drawn and collided against, recomputed
+      // from basePoints scaled toward centroid each time it's hit, while
+      // basePoints itself is never mutated.
+      return {
+        points, fill: slot.fill, stroke: slot.stroke, edges: edgesOf(points),
+        basePoints: points, centroid: centroidOf(points), hits: 0, destroyed: false
+      };
     });
   }
 
   let obstacles = generateObstacles();
+
+  // A bullet hit chips an obstacle down: each hit shrinks it a bit more
+  // toward its own centroid, until OBSTACLE_HITS_TO_DESTROY hits fully
+  // clears it from the arena. Shares the same shrink-toward-center idea
+  // as nothing else in the game, but reuses centroidOf/edgesOf above so
+  // the resulting shape is just a smaller version of the same polygon -
+  // no new geometry code needed for collision/rendering to keep working.
+  function damageObstacle(obs, now) {
+    obs.hits++;
+    const remaining = Math.max(0, 1 - obs.hits / OBSTACLE_HITS_TO_DESTROY);
+    if (remaining <= 0.02) {
+      obs.destroyed = true;
+      popups.push({ x: obs.centroid[0], y: obs.centroid[1], text: "shattered!", born: now, color: [148, 163, 184] });
+      return;
+    }
+    const [ccx, ccy] = obs.centroid;
+    obs.points = obs.basePoints.map(([x, y]) => [ccx + (x - ccx) * remaining, ccy + (y - ccy) * remaining]);
+    obs.edges = edgesOf(obs.points);
+    popups.push({ x: obs.centroid[0] + randRange(-14, 14), y: obs.centroid[1] + randRange(-14, 14), text: "chip!", born: now, color: [148, 163, 184] });
+  }
+
+  function bulletHitsObstacle(b, obs) {
+    if (pointInPolygon(b.x, b.y, obs.points)) return true;
+    for (const [a, c] of obs.edges) {
+      const [cx, cy] = closestPointOnSegment(b.x, b.y, a[0], a[1], c[0], c[1]);
+      if (Math.hypot(b.x - cx, b.y - cy) < BULLET_RADIUS + 3) return true;
+    }
+    return false;
+  }
 
   // ---------- pellets ----------
   // Pacman-style bonus pellets, sown along randomly chosen sine, cosine
@@ -607,6 +790,8 @@
   let storm = spawnStorm();
   let inStorm = false;            // true while Zippy is inside the storm right now (read by the HUD)
   let popups = []; // transient pickup feedback text ("+500", "x2.5 SCORE!", ...)
+  let bullets = [];    // Zippy's shots in flight - see getFireState()/tick()
+  let nextFireAt = 0;  // performance.now() timestamp the next shot is allowed
 
   // ---------- balls ----------
   // Zippy (special) spawns away from the other four, in a clear corner,
@@ -628,7 +813,8 @@
         r: RADIUS,
         color: colors[i],
         special,
-        faceVariant: i % 4
+        faceVariant: i % 4,
+        stunnedUntil: 0 // a bullet hit sets this to now+STUN_MS; see tick()
       };
     });
   }
@@ -945,6 +1131,15 @@
     touch.x = 0;
     touch.y = 0;
     setHandle(0, 0);
+    // same idea for the aim stick and a held mouse button - a new life
+    // shouldn't start already firing because of leftover input state
+    aimPointerId = null;
+    aim.x = 0;
+    aim.y = 0;
+    setAimHandle(0, 0);
+    mouse.down = false;
+    bullets = [];
+    nextFireAt = 0;
     graceUntil = now + SPAWN_GRACE_MS;
     distance = 0;
     timeSurvived = 0;
@@ -1235,8 +1430,32 @@
     ctx.fill();
   }
 
+  // A stunned ball's "seeing stars" - three little stars orbiting just
+  // above its head while it's frozen (STUN_MS - see tick()).
+  function drawStunStars(ball, now) {
+    ctx.fillStyle = "#7dd3fc";
+    ctx.font = "bold 10px -apple-system, BlinkMacSystemFont, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
+    for (let i = 0; i < 3; i++) {
+      const a = now / 260 + i * (Math.PI * 2 / 3);
+      const sx = ball.x + Math.cos(a) * ball.r * 1.7;
+      const sy = ball.y - ball.r * 1.7 + Math.sin(a) * 4;
+      ctx.fillText("✦", sx, sy);
+    }
+  }
+
   function drawBall(ball, now) {
+    const stunned = !ball.special && ball.stunnedUntil && now < ball.stunnedUntil;
     if (ball.special) drawHalo(ball, now);
+    if (stunned) {
+      const pulse = 0.5 + 0.5 * Math.sin(now / 130);
+      ctx.beginPath();
+      ctx.arc(ball.x, ball.y, ball.r * (1.5 + 0.3 * pulse), 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(125,211,252,${0.45 + 0.3 * pulse})`;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
 
     ctx.beginPath();
     if (ball.special) {
@@ -1254,7 +1473,7 @@
     } else {
       ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
     }
-    ctx.fillStyle = ball.color;
+    ctx.fillStyle = stunned ? "#93c5fd" : ball.color;
     ctx.shadowColor = ball.color;
     ctx.shadowBlur = ball.special ? 18 : 12;
     ctx.fill();
@@ -1266,7 +1485,21 @@
       drawFace(ball, gameOver);
     } else {
       drawAngryFace(ball, ball.faceVariant);
+      if (stunned) drawStunStars(ball, now);
     }
+  }
+
+  // White-hot with a cyan glow - deliberately far from every other color
+  // in play (gold pellets/coin, red storm, orange/purple/etc. obstacle
+  // accents) so a bullet always reads as "weapon", never "pickup".
+  function drawBullet(b) {
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, BULLET_RADIUS, 0, Math.PI * 2);
+    ctx.fillStyle = "#f8fafc";
+    ctx.shadowColor = "#67e8f9";
+    ctx.shadowBlur = 10;
+    ctx.fill();
+    ctx.shadowBlur = 0;
   }
 
   function drawHud(now) {
@@ -1469,6 +1702,7 @@
       if (bonusPellet) drawBonusPellet(bonusPellet, now);
     }
     balls.forEach((b) => drawBall(b, now));
+    if (!gameOver) bullets.forEach(drawBullet);
     if (!gameOver) drawStorm(storm, now);
     if (gameOver) {
       if (gameOverPhase === "checking") drawGameOverBusy("Checking the global leaderboard…");
@@ -1517,6 +1751,12 @@
       for (const ball of balls) {
         if (ball.special) {
           applyPlayerControl(ball, dt);
+        } else if (ball.stunnedUntil && now < ball.stunnedUntil) {
+          // a stunned ball is frozen in place - no movement, no collision
+          // resolution needed since it isn't going anywhere - but it's
+          // still solid: checkSpecialCollision() below doesn't check stun
+          // state, so bumping into it is still game over
+          continue;
         }
         ball.x += ball.vx * dt;
         ball.y += ball.vy * dt;
@@ -1583,6 +1823,56 @@
           bonusPellet = null;
         }
       }
+
+      // Shooting: aim (mouse or the second touch stick) is entirely
+      // independent of movement, Robotron-style - Zippy can run one way
+      // and shoot another at the same time. Firing is rate-limited by
+      // FIRE_INTERVAL_MS rather than per-press, since both input methods
+      // are "hold to fire". Bullets are simple - constant velocity,
+      // culled on a lifetime or leaving the arena - and are checked
+      // against enemy balls (stun) and obstacles (chip damage) below.
+      if (special && now >= graceUntil) {
+        const fire = getFireState(special);
+        if (fire.firing && now >= nextFireAt) {
+          bullets.push({
+            x: special.x + fire.dx * (special.r + 4),
+            y: special.y + fire.dy * (special.r + 4),
+            vx: fire.dx * BULLET_SPEED,
+            vy: fire.dy * BULLET_SPEED,
+            born: now
+          });
+          nextFireAt = now + FIRE_INTERVAL_MS;
+        }
+      }
+      for (let bi = bullets.length - 1; bi >= 0; bi--) {
+        const b = bullets[bi];
+        b.x += b.vx * dt;
+        b.y += b.vy * dt;
+        let spent = (now - b.born > BULLET_LIFETIME_MS) ||
+          b.x < -10 || b.x > W + 10 || b.y < -10 || b.y > H + 10;
+        if (!spent) {
+          for (const ball of balls) {
+            if (ball.special) continue;
+            if (Math.hypot(ball.x - b.x, ball.y - b.y) < ball.r + BULLET_RADIUS) {
+              ball.stunnedUntil = now + STUN_MS;
+              popups.push({ x: ball.x, y: ball.y, text: "STUN!", born: now, color: [125, 211, 252] });
+              spent = true;
+              break;
+            }
+          }
+        }
+        if (!spent) {
+          for (const obs of obstacles) {
+            if (bulletHitsObstacle(b, obs)) {
+              damageObstacle(obs, now);
+              spent = true;
+              break;
+            }
+          }
+        }
+        if (spent) bullets.splice(bi, 1);
+      }
+      if (obstacles.some(o => o.destroyed)) obstacles = obstacles.filter(o => !o.destroyed);
 
       // Storm hazard already moved earlier this frame (before the balls
       // loop, so the enemy-slowdown check above saw this frame's storm
