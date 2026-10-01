@@ -197,9 +197,16 @@
   canvas.width = W * RENDER_SCALE;
   canvas.height = H * RENDER_SCALE;
   ctx.scale(RENDER_SCALE, RENDER_SCALE);
-  const SPEED = 260; // px/sec, the enemy balls' starting speed at the top of each life
-  const ENEMY_SPEED_RAMP = 6; // px/sec added per second survived, so it gets harder the longer you last
-  const ENEMY_MAX_SPEED = 520; // cap so the ramp doesn't run away forever
+  // Enemy balls no longer get faster just from elapsed time - see
+  // ballSpeedNow() further down. They start slower than before and only
+  // speed up in discrete steps, one step each time a given ball recovers
+  // from a bullet stun (see the stun-recovery handling in tick()), so
+  // repeatedly "stunlocking" the same ball to neutralize it is
+  // self-defeating: it comes back faster and more dangerous every time,
+  // instead of being a free, risk-free lockdown.
+  const ENEMY_BASE_SPEED = 150;     // px/sec, every ball's starting speed at the top of each life
+  const ENEMY_SPEED_PER_LEVEL = 70; // px/sec added each time a ball recovers from a stun
+  const ENEMY_MAX_SPEED = 520;      // cap so leveling up doesn't run away forever
   const SPECIAL_COLOR = "#4ade80";
   const READY_INPUT_DELAY_MS = 400; // brief pause before a "ready" input is accepted, so the score is readable and can't be skipped instantly
   const SPAWN_GRACE_MS = 1500; // brief invulnerability right after a respawn
@@ -260,7 +267,7 @@
   // real score the longer Zippy actually stays there.
   const STORM_RADIUS = Math.sqrt((W * H) / (6 * Math.PI)); // area ~= 1/6 of the 900x600 arena
   const STORM_SPEED = 18;               // px/sec - much slower than even the bonus coin
-  const STORM_DRAIN_RATE = 0.15;        // fraction of survivalScore lost per second while sheltering (time-bonus growth is also fully frozen - see tick())
+  const STORM_DRAIN_RATE = 0.35;        // fraction of survivalScore lost per second while sheltering (time-bonus growth is also fully frozen - see tick())
   const STORM_ENEMY_SLOW = 0.5;         // enemy balls move at this fraction of their normal speed while inside
 
   // ---------- shooting (Robotron-style twin-stick) ----------
@@ -278,7 +285,7 @@
   const FIRE_INTERVAL_MS = 130;      // minimum ms between shots while firing is held (~7.7 shots/sec)
   const AIM_DEADZONE = 0.35;         // aim stick must be pushed at least this far from center to count as aiming/firing
   const STUN_MS = 5000;
-  const OBSTACLE_HITS_TO_DESTROY = 6; // bullet hits an obstacle takes before it's fully chipped away
+  const OBSTACLE_HITS_TO_DESTROY = 60; // bullet hits an obstacle takes before it's fully chipped away - each hit only chips ~10% as much progress as the original 6-hit version, so spraying bullets doesn't clear the field in a couple of seconds
 
   // ---------- global leaderboard ----------
   // A free, no-login shared JSON bin (json.extendsclass.com) holds the top
@@ -809,19 +816,33 @@
   const spawnPoints = [[400, 300], [500, 300], [450, 250], [450, 350], [450, 130]];
   const RADIUS = 11;
 
+  // Each of the 4 enemy balls gets its own fixed behavioral personality,
+  // Pac-Man-ghost-style, instead of all four just bouncing identically -
+  // see steerEnemy() for how each one picks its heading every frame.
+  // Assigned by spawn-slot index, same index that already drives each
+  // ball's distinct face (faceVariant).
+  const PERSONALITIES = ["zone", "chase", "patrol", "random"];
+
   function initBalls() {
     return spawnPoints.map((p, i) => {
       const special = colors[i] === SPECIAL_COLOR;
       const angle = Math.random() * Math.PI * 2;
       return {
         x: p[0], y: p[1],
-        vx: special ? 0 : Math.cos(angle) * SPEED,
-        vy: special ? 0 : Math.sin(angle) * SPEED,
+        vx: special ? 0 : Math.cos(angle) * ENEMY_BASE_SPEED,
+        vy: special ? 0 : Math.sin(angle) * ENEMY_BASE_SPEED,
         r: RADIUS,
         color: colors[i],
         special,
         faceVariant: i % 4,
-        stunnedUntil: 0 // a bullet hit sets this to now+STUN_MS; see tick()
+        stunnedUntil: 0,   // a bullet hit sets this to now+STUN_MS; see tick()
+        wasStunned: false, // tracks the stun -> recovered transition, see tick()
+        speedLevel: 0,     // bumped by one each time this ball recovers from a stun - see ballSpeedNow()
+        personality: special ? null : PERSONALITIES[i % PERSONALITIES.length],
+        homeX: p[0], homeY: p[1], // "zone" personality defends the area around its own spawn point
+        patrolIndex: 0,           // "patrol" personality's current target waypoint
+        randomAngle: angle,       // "random" personality's current heading target
+        nextRandomRetargetAt: 0
       };
     });
   }
@@ -858,7 +879,8 @@
   let newBestTime = false;
   let newBestScore = false;
   let distance = 0;
-  let timeSurvived = 0;
+  let timeSurvived = 0;    // total life duration regardless of the storm - this is the HUD's TIME stat
+  let timeOutsideStorm = 0; // only advances while NOT sheltering in the storm - this is what scoring uses as "time", see tick()
   let pelletScore = 0;
   let score = 0;
   // score = max(0, survivalScore + pelletScore). survivalScore accumulates
@@ -1015,9 +1037,80 @@
     ball.vy = ny * speed;
   }
 
-  // enemy balls start at SPEED and ramp up the longer the current life lasts
-  function enemySpeedNow() {
-    return Math.min(ENEMY_MAX_SPEED, SPEED + ENEMY_SPEED_RAMP * timeSurvived);
+  // a ball's speed is purely a function of its own stun-recovery level now,
+  // not elapsed time - see the ENEMY_BASE_SPEED/ENEMY_SPEED_PER_LEVEL
+  // comment above and the stun-recovery handling in tick()
+  function ballSpeedNow(ball) {
+    return Math.min(ENEMY_MAX_SPEED, ENEMY_BASE_SPEED + ball.speedLevel * ENEMY_SPEED_PER_LEVEL);
+  }
+
+  // ---------- enemy personalities (Pac-Man-ghost-style steering) ----------
+  // All 4 enemy balls still move and bounce with the same physics
+  // (resolveObstacleCollisions/resolveWallCollisions, called right after
+  // steerEnemy() in tick()) - personality only decides which *heading*
+  // each one steers toward between bounces, via a bounded turn each frame
+  // rather than an instant snap, so they visibly curve instead of
+  // teleporting direction.
+  const ZONE_RADIUS = 160;        // "zone" personality's leash distance from its home point before it turns back
+  const ENEMY_TURN_RATE = 2.6;    // rad/sec - how fast chase/patrol/random can change heading
+  const ZONE_TURN_RATE = 3.5;     // rad/sec - snappier correction when a "zone" ball strays past its leash
+  const RANDOM_RETARGET_MIN_MS = 500;
+  const RANDOM_RETARGET_MAX_MS = 1100;
+  const PATROL_WAYPOINTS = [[150, 150], [750, 150], [750, 450], [150, 450]]; // fixed, predictable rectangular loop
+  const PATROL_WAYPOINT_RADIUS = 24; // how close counts as "reached" before advancing to the next waypoint
+
+  // normalizes an angle difference to (-PI, PI] so a turn always goes the
+  // shorter way around
+  function angleDiff(a, b) {
+    let d = a - b;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return d;
+  }
+
+  function steerEnemy(ball, dt, now, special) {
+    const currentAngle = Math.atan2(ball.vy, ball.vx);
+    let desiredAngle = currentAngle; // default: no correction, keep whatever the last bounce left it with
+    let turnRate = ENEMY_TURN_RATE;
+
+    if (ball.personality === "zone") {
+      // stays near home; only steers when it's strayed past its leash -
+      // a true zone defender never chases, it just won't wander off
+      const distFromHome = Math.hypot(ball.x - ball.homeX, ball.y - ball.homeY);
+      if (distFromHome > ZONE_RADIUS) {
+        desiredAngle = Math.atan2(ball.homeY - ball.y, ball.homeX - ball.x);
+        turnRate = ZONE_TURN_RATE;
+      }
+    } else if (ball.personality === "chase") {
+      // direct pursuit - always steers toward Zippy's current position
+      if (special) desiredAngle = Math.atan2(special.y - ball.y, special.x - ball.x);
+    } else if (ball.personality === "patrol") {
+      // fully deterministic - cycles the same fixed loop every life,
+      // completely independent of Zippy, hence "roves predictably"
+      const target = PATROL_WAYPOINTS[ball.patrolIndex];
+      if (Math.hypot(target[0] - ball.x, target[1] - ball.y) < PATROL_WAYPOINT_RADIUS) {
+        ball.patrolIndex = (ball.patrolIndex + 1) % PATROL_WAYPOINTS.length;
+      }
+      const next = PATROL_WAYPOINTS[ball.patrolIndex];
+      desiredAngle = Math.atan2(next[1] - ball.y, next[0] - ball.x);
+    } else if (ball.personality === "random") {
+      // picks a brand new random heading every RANDOM_RETARGET_*_MS and
+      // turns faster than the others, so it reads as erratic rather than
+      // just another gentle curve
+      if (now >= ball.nextRandomRetargetAt) {
+        ball.randomAngle = Math.random() * Math.PI * 2;
+        ball.nextRandomRetargetAt = now + RANDOM_RETARGET_MIN_MS + Math.random() * (RANDOM_RETARGET_MAX_MS - RANDOM_RETARGET_MIN_MS);
+      }
+      desiredAngle = ball.randomAngle;
+      turnRate = ENEMY_TURN_RATE * 1.6;
+    }
+
+    const maxTurn = turnRate * dt;
+    const turn = Math.max(-maxTurn, Math.min(maxTurn, angleDiff(desiredAngle, currentAngle)));
+    const newAngle = currentAngle + turn;
+    const speed = Math.hypot(ball.vx, ball.vy);
+    ball.vx = Math.cos(newAngle) * speed;
+    ball.vy = Math.sin(newAngle) * speed;
   }
 
   // WASD / touch thrust + friction + hard speed cap for Zippy
@@ -1154,6 +1247,7 @@
     graceUntil = now + SPAWN_GRACE_MS;
     distance = 0;
     timeSurvived = 0;
+    timeOutsideStorm = 0;
     pelletScore = 0;
     score = 0;
     survivalScore = 0;
@@ -1759,6 +1853,14 @@
       storm.y += storm.vy * dt;
       resolveStormWallCollisions(storm);
 
+      // declared before the balls loop (rather than after, as earlier
+      // builds had it) so "chase" personalities below can steer toward
+      // Zippy's position this same pass - balls.find() still returns the
+      // same object the post-loop code below uses, just found a bit
+      // sooner; its x/y just reflect last frame's position until
+      // applyPlayerControl() updates it later in this same loop
+      const special = balls.find(b => b.special);
+
       for (const ball of balls) {
         if (ball.special) {
           applyPlayerControl(ball, dt);
@@ -1768,7 +1870,17 @@
           // longer solid to Zippy either: checkSpecialCollision() below
           // skips stunned balls, so running through one is safe (stunning
           // buys passable room to maneuver, not just a frozen obstacle)
+          ball.wasStunned = true;
           continue;
+        } else {
+          if (ball.wasStunned) {
+            // just recovered from a stun this frame - bump to the next
+            // speed level, the penalty for stunlocking the same ball
+            // over and over (see ENEMY_BASE_SPEED/ENEMY_SPEED_PER_LEVEL)
+            ball.wasStunned = false;
+            ball.speedLevel++;
+          }
+          steerEnemy(ball, dt, now, special);
         }
         ball.x += ball.vx * dt;
         ball.y += ball.vy * dt;
@@ -1781,11 +1893,9 @@
           // speed while inside the storm - it slows rivals down too,
           // not just Zippy
           const inStormNow = Math.hypot(ball.x - storm.x, ball.y - storm.y) < storm.r + ball.r;
-          clampSpeed(ball, enemySpeedNow() * (inStormNow ? STORM_ENEMY_SLOW : 1));
+          clampSpeed(ball, ballSpeedNow(ball) * (inStormNow ? STORM_ENEMY_SLOW : 1));
         }
       }
-
-      const special = balls.find(b => b.special);
 
       // Pacman-style pellet pickups: a flat, significant bonus straight
       // into score (boosted while the multiplier is active). Every
@@ -1892,19 +2002,31 @@
       inStorm = now >= graceUntil && !!special &&
         Math.hypot(special.x - storm.x, special.y - storm.y) < storm.r + special.r;
 
+      // timeOutsideStorm is the ONLY thing that stands in for "time" in
+      // the scoring formula below - it simply never advances while
+      // Zippy is sheltering, so storm time can never contribute to the
+      // time-bonus, full stop (timeSurvived keeps counting regardless,
+      // for the HUD's plain survival-time stat).
+      if (!inStorm) timeOutsideStorm += dt;
+
       popups = popups.filter(p => now - p.born < POPUP_LIFE);
 
-      // survivalScore accumulates this frame's share of distance x time
-      // growth, scaled by whatever multiplier is active right now - unless
-      // Zippy is sheltering in the storm, in which case that growth is
-      // frozen outright (camping can't bank passive time-bonus income) and
+      // survivalScore accumulates this frame's share of distance x
+      // timeOutsideStorm growth, scaled by whatever multiplier is active
+      // right now - unless Zippy is sheltering in the storm, in which
+      // case that growth is frozen outright (camping can't bank passive
+      // time-bonus income, and since timeOutsideStorm itself doesn't
+      // move while sheltering, the "time" side of the score is purely
+      // seconds spent outside the storm and nothing else) and
       // survivalScore instead decays a percentage of itself toward zero
       // every second (STORM_DRAIN_RATE), so hiding out is actively
-      // punished rather than merely neutral. prevDistanceTimeProduct still
-      // advances every frame regardless of inStorm, so leaving the storm
-      // resumes growth from exactly where it left off instead of dumping
-      // the whole frozen interval's growth in one lump sum the next frame.
-      const distanceTimeProduct = distance * timeSurvived;
+      // punished rather than merely neutral. prevDistanceTimeProduct
+      // still advances every frame regardless of inStorm, so leaving the
+      // storm resumes growth from exactly where it left off instead of
+      // dumping the whole frozen interval's growth - or a jump back up
+      // to what the plain time total would have earned - in one lump sum
+      // the next frame.
+      const distanceTimeProduct = distance * timeOutsideStorm;
       if (!inStorm) {
         survivalScore += (distanceTimeProduct - prevDistanceTimeProduct) * scoreMultiplier;
       }
