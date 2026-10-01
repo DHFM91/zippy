@@ -245,15 +245,22 @@
   // storm's *center* crossing the wall (a circle is symmetric, so when
   // its center sits exactly on the boundary, exactly half its area is
   // already off-screen) - see resolveStormWallCollisions(). While Zippy's
-  // center is inside it, score drains continuously rather than in a lump,
-  // consistent with how the rest of scoring accumulates frame by frame.
-  // It also bogs down the enemy balls (not just Zippy) while they're
-  // inside it, so it isn't purely a hazard for the player to dodge - it
-  // reshuffles the whole arena's danger, occasionally turning a "safe"
-  // camping spot into one where a slowed rival is easier to outmaneuver.
+  // center is inside it, the time-bonus (distance x time) growth that
+  // normally feeds survivalScore is frozen outright - sheltering in the
+  // storm can never bank passive score - and on top of that survivalScore
+  // decays by a percentage of itself every second, so camping in there is
+  // actively punished rather than just neutral. (An earlier version just
+  // subtracted a flat amount per second, but that couldn't keep pace once
+  // a run had already banked enough distance for the frozen formula to
+  // outgrow any fixed penalty - see tick() for the current math.) It also
+  // bogs down the enemy balls (not just Zippy) while they're inside it, so
+  // it isn't purely a hazard for the player to dodge - it reshuffles the
+  // whole arena's danger, occasionally turning a "safe" camping spot into
+  // one where a slowed rival is easier to outmaneuver, while still costing
+  // real score the longer Zippy actually stays there.
   const STORM_RADIUS = Math.sqrt((W * H) / (6 * Math.PI)); // area ~= 1/6 of the 900x600 arena
   const STORM_SPEED = 18;               // px/sec - much slower than even the bonus coin
-  const STORM_DRAIN_PER_SEC = 500;      // points lost per second Zippy spends inside it
+  const STORM_DRAIN_RATE = 0.15;        // fraction of survivalScore lost per second while sheltering (time-bonus growth is also fully frozen - see tick())
   const STORM_ENEMY_SLOW = 0.5;         // enemy balls move at this fraction of their normal speed while inside
 
   // ---------- shooting (Robotron-style twin-stick) ----------
@@ -1550,7 +1557,7 @@
     if (inStorm) {
       ctx.fillStyle = "#f87171";
       ctx.font = "bold 10px -apple-system, BlinkMacSystemFont, sans-serif";
-      ctx.fillText("IN STORM -" + STORM_DRAIN_PER_SEC + "/s", W / 2, by + 40);
+      ctx.fillText("IN STORM -" + Math.round(STORM_DRAIN_RATE * 100) + "%/s", W / 2, by + 40);
     } else if (scoreMultiplier > 1 && now < multiplierUntil) {
       const remaining = (multiplierUntil - now) / 1000;
       ctx.fillStyle = "#fbbf24";
@@ -1888,14 +1895,21 @@
       popups = popups.filter(p => now - p.born < POPUP_LIFE);
 
       // survivalScore accumulates this frame's share of distance x time
-      // growth, scaled by whatever multiplier is active right now, minus
-      // whatever the storm drains this frame if Zippy is currently inside
-      // it - see the declaration above for why this telescopes back to
-      // the plain distance * timeSurvived formula when neither is in play.
+      // growth, scaled by whatever multiplier is active right now - unless
+      // Zippy is sheltering in the storm, in which case that growth is
+      // frozen outright (camping can't bank passive time-bonus income) and
+      // survivalScore instead decays a percentage of itself toward zero
+      // every second (STORM_DRAIN_RATE), so hiding out is actively
+      // punished rather than merely neutral. prevDistanceTimeProduct still
+      // advances every frame regardless of inStorm, so leaving the storm
+      // resumes growth from exactly where it left off instead of dumping
+      // the whole frozen interval's growth in one lump sum the next frame.
       const distanceTimeProduct = distance * timeSurvived;
-      survivalScore += (distanceTimeProduct - prevDistanceTimeProduct) * scoreMultiplier;
+      if (!inStorm) {
+        survivalScore += (distanceTimeProduct - prevDistanceTimeProduct) * scoreMultiplier;
+      }
       prevDistanceTimeProduct = distanceTimeProduct;
-      if (inStorm) survivalScore -= STORM_DRAIN_PER_SEC * dt;
+      if (inStorm) survivalScore -= survivalScore * STORM_DRAIN_RATE * dt;
       score = Math.max(0, survivalScore + pelletScore);
       if (now >= graceUntil && checkSpecialCollision(now)) {
         gameOver = true;
