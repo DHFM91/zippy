@@ -303,6 +303,7 @@
   // directly if they found the URL, and it isn't guaranteed to be
   // permanent (no SLA from the free service).
   const LEADERBOARD_URL = "https://json.extendsclass.com/bin/3e101eb0a004";
+  const lbReadJson = async r => { const t = await r.text(), i = t.search(/<!doctype|<html/i); return JSON.parse(i < 0 ? t : t.slice(0, i)); }; // the score host sometimes tacks a web page onto its reply; read only the JSON part
   const LEADERBOARD_SIZE = 10;
   const LEADERBOARD_FETCH_TIMEOUT_MS = 6000;
 
@@ -955,7 +956,7 @@
     try {
       const resp = await fetchWithTimeout(LEADERBOARD_URL, { cache: "no-store" });
       if (!resp.ok) throw new Error("bad status " + resp.status);
-      const data = await resp.json();
+      const data = await lbReadJson(resp);
       if (Array.isArray(data)) {
         highScores = data
           .filter(e => e && typeof e.score === "number" && typeof e.initials === "string")
